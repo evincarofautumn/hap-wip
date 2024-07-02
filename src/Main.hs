@@ -14,22 +14,25 @@
 module Main where
 
 import Control.Concurrent (forkIO, forkOS)
-import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.MVar qualified as MVar
+import Control.Concurrent.Async qualified as Async
+import Control.Concurrent.Chan (Chan)
+import Control.Concurrent.Chan qualified as Chan
 import Control.Concurrent.STM.TBQueue (TBQueue, flushTBQueue)
 import Control.Concurrent.STM.TBQueue qualified as TBQueue
 import Control.Concurrent.STM.TChan (TChan)
 import Control.Concurrent.STM.TChan qualified as TChan
-import Control.Concurrent.STM.TMVar (TMVar, isEmptyTMVar, newEmptyTMVar, putTMVar, takeTMVar)
-import Control.Concurrent.STM.TMVar qualified as TMVar
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', readTVar, stateTVar, writeTVar)
 import Control.Concurrent.STM.TVar qualified as TVar
 import Control.Exception (Exception, SomeException(SomeException), finally, throwIO, try)
+import Control.Exception qualified as Exception
 import Control.Monad ((<=<), join, void, when)
 import Control.Monad.IO.Class (MonadIO(liftIO))
+import Control.Monad.Except (MonadError, ExceptT)
+import Control.Monad.Except qualified as Error
 import Control.Monad.Reader (MonadReader, ReaderT)
 import Control.Monad.Reader qualified as Reader
-import Control.Monad.STM (STM)
+import Control.Monad.STM (STM, orElse)
+import Control.Monad.STM qualified as STM
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Writer (MonadWriter, WriterT)
 import Control.Monad.Writer qualified as Writer
@@ -37,8 +40,10 @@ import Data.ByteString qualified as ByteString
 import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DList
+import Data.Either qualified as Lazy (partitionEithers)
 import Data.Foldable (for_)
 import Data.Function ((&))
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
@@ -49,6 +54,7 @@ import Data.Strict.Either (Either(Left, Right))
 import Data.Strict.Maybe (Maybe(Nothing, Just))
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Text.IO qualified as Text.IO
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
 import Data.Void (Void)
@@ -74,10 +80,6 @@ import System.Mem.Weak (Weak, mkWeakPtr)
 
 main :: IO ()
 main = start defaultSettings
-
-debug :: String -> IO ()
---  debug = hPutStrLn stderr
-debug _ = pure ()
 
 ----------------------------------------------------------------
 
@@ -116,7 +118,6 @@ defaultSettings =
 
 start :: Settings -> IO ()
 start settings = do
-
   messages <- messagesNew
   world <- worldNew
   compiledPrograms <- hapRun
@@ -124,41 +125,28 @@ start settings = do
     (compileAll settings.sources)
 
   let
-    startInput = (void . forkIO) do
-      debug "input thread"
-      debug "running programs"
+    startInput = do
       hapRun world do
         for_ compiledPrograms void
-      debug "running input"
       exitCode <- case settings.input of
-        InputBatch -> do
-          debug "batch mode"
+        InputBatch ->
           pure ExitSuccess
-        InputInteractive -> do
-          debug "interactive mode"
-          consoleRun world
-      debug "done input thread"
-      messagesInterrupt messages exitCode
+        InputInteractive ->
+          consoleRun messages world
+      messagesRequest messages (RequestExit exitCode)
 
-    startOutput = do
-      debug "output thread"
+    startOutput =
       case settings.output of
-        OutputGraphics -> do
-          debug "graphics mode"
-          graphicsRun messages startInput
-        OutputText -> do
-          debug "text mode"
-          startInput
+        OutputGraphics ->
+          graphicsRun messages
+        OutputText ->
           messagesLoop
             messages
-            (\_interrupt -> pure ())
+            (pure ())
             (\_request -> pure ())
 
-  debug "starting output"
-  startOutput
-
-  debug "waiting"
-  exitWith =<< messagesWait messages
+  exitWith =<< Async.withAsync startInput \_input ->
+    startOutput
 
 compileOne :: Source -> Code ProgramCompiled
 compileOne source = do
@@ -182,14 +170,9 @@ compileAll sources = do
 
 data Messages =
   Messages {
-    interruptions :: !(MVar Interruption),
     requests :: !(TBQueue Request)
-    --  requests :: !(TChan Request)
   }
   deriving stock (Generic)
-
-type Interruption =
-  ExitCode
 
 data Request
   = RequestOutput !Text
@@ -197,6 +180,7 @@ data Request
   | RequestGraphicsBackgroundSet
     !(Word8) !(Word8) !(Word8) !(Word8)
   | RequestGraphicsPresent
+  | RequestExit !ExitCode
   deriving stock (Generic, Show)
 
 data Graphics =
@@ -208,148 +192,126 @@ data Graphics =
 
 messagesNew :: IO Messages
 messagesNew = do
-  interruptions <- newEmptyMVar
-  --  requests <- newTChanIO
   requests <- newTBQueueIO requestsCapacity
-  pure
-    Messages {
-      interruptions,
-      requests
-    }
+  pure Messages { requests }
 
 requestsCapacity :: Natural
 requestsCapacity = 1024
 
-graphicsNew :: IO Graphics
-graphicsNew = do
-  debug "starting graphics"
+graphicsWith :: (Graphics -> IO a) -> IO a
+graphicsWith = Exception.bracket graphicsBegin graphicsEnd
+
+graphicsBegin :: IO Graphics
+graphicsBegin = do
   SDL.initializeAll
-  debug "creating window"
   window <- SDL.createWindow "Hap" SDL.defaultWindow
   let firstSupportedDriver = -1
-  debug "creating renderer"
   renderer <- SDL.createRenderer
     window
     firstSupportedDriver
     SDL.defaultRenderer
-  debug "done starting graphics"
   pure
     Graphics {
       window,
       renderer
     }
 
-graphicsRun :: Messages -> IO () -> IO ()
-graphicsRun messages inited = do
-  debug "running graphics"
-  graphics <- graphicsNew
-  debug "starting graphics loop"
-  inited
-  messagesLoop
-    messages
-    (graphicsHandleEvents graphics)
-    (graphicsHandleRequest graphics)
-  graphicsEnd graphics
-  debug "done running graphics"
+graphicsEnd :: Graphics -> IO ()
+graphicsEnd graphics = do
+  SDL.destroyWindow graphics.window
 
-graphicsHandleEvents ::
-  Graphics -> (Interruption -> IO ()) -> IO ()
-graphicsHandleEvents graphics interrupt = do
-  debug "polling for events"
-  events <- SDL.pollEvents
+graphicsRun :: Messages -> IO ExitCode
+graphicsRun messages =
+  graphicsWith \graphics ->
+    messagesLoop
+      messages
+      (graphicsPoll graphics messages)
+      (graphicsRequest graphics)
+
+graphicsPoll ::
+  Graphics -> Messages -> ExceptT ExitCode IO ()
+graphicsPoll graphics messages = do
+  events <- liftIO SDL.pollEvents
   let
-    (interruptions, messages) =
-      partition isInterruption events
-  if null interruptions
-    then do
-      debug "no interruptions"
-      for_ messages (graphicsHandleEvent graphics)
-    else do
-      debug "interrupted"
-      interrupt ExitSuccess
+    (interruptions, payloads) =
+      Lazy.partitionEithers (fmap eventParse events)
+  case interruptions of
+    exitCode : _ -> Error.throwError exitCode
+    [] -> for_ payloads (graphicsEvent graphics)
 
-graphicsHandleEvent :: Graphics -> SDL.Event -> IO ()
-graphicsHandleEvent graphics event = do
-  debug (show event)
-  case SDL.eventPayload event of
-    SDL.WindowShownEvent{} -> do
-      SDL.rendererDrawColor graphics.renderer $=
-        SDL.V4 192 64 64 255
-      SDL.clear graphics.renderer
-      SDL.present graphics.renderer
-    SDL.WindowExposedEvent{} -> do
-      SDL.rendererDrawColor graphics.renderer $=
-        SDL.V4 64 192 64 255
-      SDL.clear graphics.renderer
-      SDL.present graphics.renderer
-    _ -> pure ()
+graphicsEvent ::
+  Graphics ->
+  SDL.EventPayload ->
+  ExceptT ExitCode IO ()
+graphicsEvent graphics = \case
+  SDL.WindowShownEvent{} -> do
+    SDL.rendererDrawColor graphics.renderer $=
+      SDL.V4 192 64 64 255
+    SDL.clear graphics.renderer
+    SDL.present graphics.renderer
+  SDL.WindowExposedEvent{} -> do
+    SDL.rendererDrawColor graphics.renderer $=
+      SDL.V4 64 192 64 255
+    SDL.clear graphics.renderer
+    SDL.present graphics.renderer
+  _ -> pure ()
 
-graphicsHandleRequest :: Graphics -> Request -> IO ()
-graphicsHandleRequest _graphics request = do
-  debug (show request)
-  --  pure ()
+graphicsRequest ::
+  Graphics ->
+  Request ->
+  ExceptT ExitCode IO ()
+graphicsRequest graphics = \case
+  RequestOutput text -> lift do
+    Text.IO.putStrLn text
+  RequestGraphicsClear -> lift do
+    SDL.clear graphics.renderer
+  RequestGraphicsBackgroundSet r g b a -> lift do
+    SDL.rendererDrawColor graphics.renderer $=
+      SDL.V4 r g b a
+    SDL.clear graphics.renderer
+  RequestGraphicsPresent -> lift do
+    SDL.present graphics.renderer
+  RequestExit exitCode ->
+    Error.throwError exitCode
+    --  Error.liftEither (Lazy.Left exitCode)
 
-messagesInterrupt ::
-  (MonadIO m) => Messages -> Interruption -> m ()
-messagesInterrupt messages =
-  liftIO . putMVar messages.interruptions
-
-messagesWait :: 
-  (MonadIO m) => Messages -> m Interruption
-messagesWait messages =
-  liftIO (takeMVar messages.interruptions)
+messagesRequest ::
+  (MonadIO m) => Messages -> Request -> m ()
+messagesRequest messages request =
+  atomically (TBQueue.writeTBQueue messages.requests request)
 
 messagesLoop ::
   Messages ->
-  ((Interruption -> IO ()) -> IO ()) ->
-  (Request -> IO ()) ->
-  IO ()
-messagesLoop messages handleEvents handleRequest = do
-  debug "message loop"
-  loop
-  debug "done message loop"
+  ExceptT ExitCode IO () ->
+  (Request -> ExceptT ExitCode IO ()) ->
+  IO ExitCode
+messagesLoop messages poll handle =
+  fmap
+    (either Prelude.id (const ExitSuccess))
+    (Error.runExceptT loop)
   where
     loop = do
-      debug "checking for interruptions"
-      uninterrupted <- {-atomically-}
-        (isEmptyMVar messages.interruptions)
-      debug "checked for interruptions"
-      when uninterrupted do
-        debug "handling events"
-        handleEvents (messagesInterrupt messages)
-        debug "handling requests"
-        let
-          --  flush =
-          --    atomically (TChan.tryReadTChan messages.requests) >>= \case
-          --      Lazy.Just request -> do
-          --        handleRequest request
-          --        flush
-          --      Lazy.Nothing -> pure ()
-          flush = do
-            requests <- atomically (flushTBQueue messages.requests)
-            for_ requests handleRequest
-        -- flush
-        debug "looping"
-        loop
+      poll
+      requests <- lift do
+        atomically do
+          flushTBQueue messages.requests
+      for_ requests handle
+      loop
 
-graphicsEnd :: Graphics -> IO ()
-graphicsEnd graphics = do
-  debug "stopping graphics"
-  SDL.destroyWindow graphics.window
-  debug "done stopping graphics"
-
-isInterruption :: SDL.Event -> Bool
-isInterruption event = case SDL.eventPayload event of
+eventParse ::
+  SDL.Event ->
+  Lazy.Either ExitCode SDL.EventPayload
+eventParse event = case SDL.eventPayload event of
   SDL.KeyboardEvent keyboardEvent
     | let keyMotion = SDL.keyboardEventKeyMotion keyboardEvent,
       SDL.Pressed <- keyMotion,
       let keysym = SDL.keyboardEventKeysym keyboardEvent,
       SDL.KeycodeQ <- SDL.keysymKeycode keysym ->
-      True
+      Lazy.Left ExitSuccess
   SDL.QuitEvent ->
-    True
-  _ ->
-    False
+    Lazy.Left ExitSuccess
+  payload ->
+    Lazy.Right payload
 
 ----------------------------------------------------------------
 --  Reactive Cells
@@ -525,19 +487,16 @@ idNew source = atomically do
 
 data Console =
   Console {
+    messages :: !Messages,
     inputState :: !Haskeline.IO.InputState,
     world :: !World
   }
 
-consoleRun :: World -> IO ExitCode
-consoleRun world = do
-  --  Haskeline.runInputTBehavior
-  --    Haskeline.preferTerm
-  --    Haskeline.defaultSettings
-  --    (Reader.runReaderT consoleLoop world)
+consoleRun :: Messages -> World -> IO ExitCode
+consoleRun messages world = do
   inputState <- Haskeline.IO.initializeInput
     Haskeline.defaultSettings
-  let console = Console { inputState, world }
+  let console = Console { messages, inputState, world }
   Reader.runReaderT consoleLoop console
     `finally` Haskeline.IO.cancelInput inputState
 
@@ -549,11 +508,11 @@ consoleLoop = do
   lines <- consoleInput prompt
   case lines of
     Lazy.Nothing ->
-      consoleBye
+      pure ExitSuccess
     Lazy.Just line -> case parseComment line of
       Lazy.Just comment -> case parseCommand comment of
         Just CommandQuit ->
-          consoleBye
+          pure ExitSuccess
         Nothing -> do
           consoleOutput "unknown command"
           consoleLoop
@@ -561,14 +520,8 @@ consoleLoop = do
         world <- Reader.asks (.world)
         result <- liftIO
           (hapRun world (join (compileOne (SourceText line))))
-        -- (prettyText (pretty result))
         consoleOutput (Text (show result))
         consoleLoop
-
-consoleBye :: Consoled ExitCode
-consoleBye = do
-  consoleOutput "Bye"
-  pure ExitSuccess
 
 consoleInput :: String -> Consoled (Lazy.Maybe Text)
 consoleInput prompt = do
@@ -628,7 +581,7 @@ pattern Text string <- (Text.unpack -> string)
 ----------------------------------------------------------------
 
 atomically :: (MonadIO m) => STM a -> m a
-atomically = liftIO . atomically
+atomically = liftIO . STM.atomically
 
 newTBQueueIO :: (MonadIO m) => Natural -> m (TBQueue a)
 newTBQueueIO = liftIO . TBQueue.newTBQueueIO
@@ -636,16 +589,13 @@ newTBQueueIO = liftIO . TBQueue.newTBQueueIO
 newTChanIO :: (MonadIO m) => m (TChan a)
 newTChanIO = liftIO TChan.newTChanIO
 
-newEmptyTMVarIO :: (MonadIO m) => m (TMVar a)
-newEmptyTMVarIO = liftIO TMVar.newEmptyTMVarIO
-
 newTVarIO :: (MonadIO m) => a -> m (TVar a)
 newTVarIO = liftIO . TVar.newTVarIO
 
 readTVarIO :: (MonadIO m) => TVar a -> m a
 readTVarIO = liftIO . TVar.readTVarIO
 
-throw :: (Exception e, MonadIO m) => e -> CodeT m z
+throw :: (Exception e, MonadIO m) => e -> m z
 throw = liftIO . throwIO
 
 ----------------------------------------------------------------
