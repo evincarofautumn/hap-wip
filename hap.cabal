@@ -18,17 +18,7 @@ common options
 
 common dependencies
     build-depends:
-        async                   ^>= 2.2.5,
-        bytestring              ^>= 0.11.5,
-        containers              ^>= 0.6.8,
-        dlist                   ^>= 1.0,
-        mtl                     ^>= 2.3.1,
-        optics                  ^>= 0.4.2,
-        prettyprinter           ^>= 1.7.1,
-        stm                     ^>= 2.5.3.1,
-        strict                  ^>= 0.5,
-        text                    ^>= 2.1,
-        transformers            ^>= 0.6.1,
+        base                    ^>= 4.19.1.0
 
 library
     import:                     dependencies, options
@@ -38,7 +28,21 @@ library
     hs-source-dirs:             lib
 
     build-depends:
-        base                    ^>= 4.19.1.0
+
+        async                   ^>= 2.2.5,
+        bytestring              ^>= 0.11.5,
+        containers              ^>= 0.6.8,
+        dlist                   ^>= 1.0,
+        haskeline               ^>= 0.8.2,
+        mtl                     ^>= 2.3.1,
+        optics                  ^>= 0.4.2,
+        optparse-applicative    ^>= 0.18.1,
+        prettyprinter           ^>= 1.7.1,
+        sdl2                    ^>= 2.5.5.0,
+        stm                     ^>= 2.5.3.1,
+        strict                  ^>= 0.5,
+        text                    ^>= 2.1,
+        transformers            ^>= 0.6.1,
 
 executable hap
     import:                     dependencies, options
@@ -52,11 +56,7 @@ executable hap
     main-is:                    Main.hs
 
     build-depends:
-        base                    ^>= 4.19.1.0,
-        hap,
-        haskeline               ^>= 0.8.2,
-        optparse-applicative    ^>= 0.18.1,
-        sdl2                    ^>= 2.5.5.0
+        hap
 
 test-suite hap-test
 
@@ -68,5 +68,4 @@ test-suite hap-test
     type:             exitcode-stdio-1.0
 
     build-depends:
-        base                    ^>= 4.19.1.0,
         hap
