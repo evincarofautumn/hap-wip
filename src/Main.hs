@@ -5,11 +5,13 @@
 {-# Language DuplicateRecordFields #-}
 {-# Language LambdaCase #-}
 {-# Language NoFieldSelectors #-}
+{-# Language NumDecimals #-}
 {-# Language OverloadedLabels #-}
 {-# Language OverloadedRecordDot #-}
 {-# Language OverloadedStrings #-}
 {-# Language PatternSynonyms #-}
 {-# Language ViewPatterns #-}
+{-# Options_ghc -Wno-unused-imports #-}
 
 module Main where
 
@@ -41,21 +43,27 @@ import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DList
 import Data.Either qualified as Lazy (partitionEithers)
-import Data.Foldable (for_)
+import Data.Foldable (for_, toList)
 import Data.Function ((&))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
 import Data.List (partition)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Sequence (Seq((:<|), (:|>)))
 import Data.Sequence qualified as Seq
+import Data.Set (Set)
+import Data.Set qualified as Set
+import Data.Strict.Classes (toLazy, toStrict)
 import Data.Strict.Either (Either(Left, Right))
-import Data.Strict.Maybe (Maybe(Nothing, Just))
+import Data.Strict.Maybe (Maybe(Nothing, Just), maybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text.IO
-import Data.Text.Encoding (decodeUtf8)
+import Data.Text.Encoding qualified as Text.Encoding
+import Data.Text.Read qualified as Text.Read
 import Data.Traversable (for)
 import Data.Void (Void)
 import Data.Word (Word8)
@@ -64,7 +72,7 @@ import GHC.Natural (Natural)
 import Hap qualified
 import Optics ((%~))
 import Optics qualified
-import Prelude hiding (Either(..), Maybe(..), Word, error, id, lines)
+import Prelude hiding (Either(..), Maybe(..), Word, error, id, lines, maybe)
 import Prelude qualified
 import Prelude qualified as Lazy (Either(..), Maybe(..))
 import Prettyprinter (Pretty(pretty))
@@ -77,6 +85,7 @@ import System.Console.Haskeline.IO qualified as Haskeline.IO
 import System.Exit (ExitCode(..), exitWith)
 import System.IO (hPrint, hPutStrLn, stderr)
 import System.Mem.Weak (Weak, mkWeakPtr)
+import System.Timeout qualified as Timeout
 
 main :: IO ()
 main = start defaultSettings
@@ -151,7 +160,8 @@ start settings = do
 compileOne :: Source -> Code ProgramCompiled
 compileOne source = do
   loaded <- (cellNew . programLoad) source
-  parsed <- (cellNew . (programParse <=< cellGet)) loaded
+  tokenized <- (cellNew . fmap programTokenize . cellGet) loaded
+  parsed <- (cellNew . (programParse <=< cellGet)) tokenized
   compiled <- (cellNew . (programCompile <=< cellGet)) parsed
   results <- cellGet compiled
   pure results
@@ -159,7 +169,8 @@ compileOne source = do
 compileAll :: Sources -> Code (Seq ProgramCompiled)
 compileAll sources = do
   loaded <- traverse (cellNew . programLoad) sources
-  parsed <- traverse (cellNew . (programParse <=< cellGet)) loaded
+  tokenized <- traverse (cellNew . fmap programTokenize . cellGet) loaded
+  parsed <- traverse (cellNew . (programParse <=< cellGet)) tokenized
   compiled <- traverse (cellNew . (programCompile <=< cellGet)) parsed
   results <- traverse cellGet compiled
   pure results
@@ -365,12 +376,25 @@ data Cell a =
   deriving stock (Generic)
 
 data Cache a
+  --  IDEA: Split 'CacheFull' to save an indirection.
   = CacheFull !(Result a)
   | CacheEmpty
   | CacheFilling
 
 type Result =
   Either SomeException
+
+interpret :: Text -> IO (Maybe Value)
+interpret text = do
+  world <- worldNew
+  let
+    timeout_s = 2
+    micro n = 1e6 * n
+  fmap toStrict do
+    Timeout.timeout (micro timeout_s) do
+      hapRun world do
+        compiled <- compileOne (SourceText text)
+        compiled
 
 hapRun :: World -> Code a -> IO a
 hapRun world code = fmap fst (code.execute world)
@@ -418,10 +442,10 @@ data Cycle = Cycle !CellSome
   deriving stock (Show)
 
 cellNew :: Code a -> Code (Cell a)
-cellNew code = do
+cellNew code0 = do
   allocator <- Reader.asks (.allocator)
   id <- liftIO (idNew allocator)
-  code <- newTVarIO code
+  code <- newTVarIO code0
   getters <- newTVarIO Seq.Empty
   cache <- newTVarIO CacheEmpty
   let
@@ -561,20 +585,120 @@ parseCommand input0 = case Text.strip input0 of
 type Nat = Prelude.Word
 
 ----------------------------------------------------------------
--- Convenience Patterns
+--  Character Set
 ----------------------------------------------------------------
+
+pattern CharLineFeed :: Char
+pattern CharLineFeed = '\x000A'
+
+pattern CharQuotationMark :: Char
+pattern CharQuotationMark = '\x0022'
+
+pattern CharLeftParenthesis :: Char
+pattern CharLeftParenthesis = '\x0028'
+
+pattern CharRightParenthesis :: Char
+pattern CharRightParenthesis = '\x0029'
+
+pattern CharFullStop :: Char
+pattern CharFullStop = '\x002E'
+
+pattern CharLeftCurlyBracket :: Char
+pattern CharLeftCurlyBracket = '\x007B'
+
+pattern CharRightCurlyBracket :: Char
+pattern CharRightCurlyBracket = '\x007D'
+
+charIsTextEnd :: Char -> Bool
+charIsTextEnd = \case
+  CharLineFeed -> True
+  CharQuotationMark -> True
+  _ -> False
+
+charIsTokenBoundary :: Char -> Bool
+charIsTokenBoundary = \case
+  CharQuotationMark -> True
+  CharLeftParenthesis -> True
+  CharRightParenthesis -> True
+  _ -> False
+
+----------------------------------------------------------------
+--  Lexical Syntax
+----------------------------------------------------------------
+
+pattern KeywordVar :: Text
+pattern KeywordVar = "var"
+
+----------------------------------------------------------------
+--  Convenience Patterns
+----------------------------------------------------------------
+
+{-# Complete DList #-}
 
 pattern DList :: [a] -> DList a
 pattern DList list <- (DList.toList -> list)
   where
     DList list = DList.fromList list
-{-# Complete DList #-}
+
+{-# Complete Map #-}
+
+pattern Map :: (Ord k, Show k) => [(k, v)] -> Map k v
+pattern Map assocs <- (Map.toList -> assocs)
+  where
+    Map assocs =
+      Map.fromListWithKey
+        (\key _new _old ->
+          Prelude.error ("duplicate key: " <> show key))
+        assocs
+
+{-# Complete Seq #-}
+
+pattern Seq :: [a] -> Seq a
+pattern Seq list <- (toList -> list)
+  where
+    Seq list = Seq.fromList list
+
+{-# Complete Text #-}
 
 pattern Text :: String -> Text
 pattern Text string <- (Text.unpack -> string)
   where
     Text string = Text.pack string
-{-# Complete Text #-}
+
+{-# Complete TextCons, TextEmpty #-}
+
+pattern TextCons :: Char -> Text -> Text
+pattern TextCons char text <-
+  (Text.uncons -> Lazy.Just (char, text))
+  where
+    TextCons char text = Text.cons char text
+
+pattern TextEmpty :: Text
+pattern TextEmpty <- (Text.null -> True)
+  where
+    TextEmpty = Text.empty
+
+----------------------------------------------------------------
+--  Container Wrappers
+----------------------------------------------------------------
+
+newtype Union a = Union { union :: a }
+
+instance
+  (
+    Ord k,
+    Semigroup v
+  ) =>
+  Monoid (Union (Map k v)) where
+  mempty = Union Map.empty
+
+instance
+  (
+    Ord k,
+    Semigroup v
+  ) =>
+  Semigroup (Union (Map k v)) where
+  a <> b = Union (Map.unionWith (<>) a.union b.union)
 
 ----------------------------------------------------------------
 --  MonadIO Wrappers
@@ -614,8 +738,21 @@ prettyText =
 ----------------------------------------------------------------
 
 type ProgramLoaded = Text
-type ProgramParsed = Expression
+type ProgramTokenized = Tokens
+type ProgramParsed = Block
 type ProgramCompiled = Code Value
+
+type Tokens = [Token]
+
+data Token
+  = TokenWord !Text
+  | TokenKeyword !Text
+  | TokenText !Text
+  | TokenGroupBegin
+  | TokenGroupEnd
+  | TokenBlockBegin
+  | TokenBlockEnd
+  deriving stock (Generic, Show)
 
 newtype Expression = Expression { terms :: Terms }
   deriving stock (Generic, Show)
@@ -626,7 +763,8 @@ data Term
   = TermName !Name
   | TermNumber !Number
   | TermText !Text
-  | TermBlock !Bindings !Expression
+  | TermGroup !Expression
+  | TermBlock !Block
   deriving stock (Generic, Show)
 
 data Value
@@ -634,18 +772,14 @@ data Value
   | ValueText !Text
   deriving stock (Generic, Show)
 
-type Bindings = Seq Binding
-
-data Binding
-  = Binding {
-    name :: !Name,
-    annotation :: !(Maybe Expression)
-  }
+data Block = Block !Bindings !Expression
   deriving stock (Generic, Show)
+
+type Bindings = Set Name
 
 newtype Name =
   Name { spelling :: Text }
-  deriving stock (Generic, Show)
+  deriving stock (Eq, Generic, Ord, Show)
 
 type Number = Integer
 
@@ -657,12 +791,137 @@ data ParseError
 programLoad :: Source -> Code ProgramLoaded
 programLoad = \case
   SourcePath path ->
-    fmap decodeUtf8 (liftIO (ByteString.readFile path))
+    fmap Text.Encoding.decodeUtf8 do
+      liftIO (ByteString.readFile path)
   SourceText text ->
     pure text
 
-programParse :: ProgramLoaded -> Code ProgramParsed
-programParse _program = throw ParseError
+programTokenize :: ProgramLoaded -> ProgramTokenized
+programTokenize = \case
+  TextCons char chars1
+    | CharQuotationMark <- char -> let
+      (text, chars2) = Text.break charIsTextEnd chars1
+      in TokenText text : programTokenize (Text.drop 1 chars2)
+    | Just token <- matchPunctuation char ->
+      token : programTokenize chars1
+    where
+      matchPunctuation = \case
+        CharLeftParenthesis -> Just TokenGroupBegin
+        CharRightParenthesis -> Just TokenGroupEnd
+        CharLeftCurlyBracket -> Just TokenBlockBegin
+        CharRightCurlyBracket -> Just TokenBlockEnd
+        _ -> Nothing
+  chars0
+    | TextEmpty <- word,
+      TextEmpty <- chars1 ->
+      []
+    | TextEmpty <- word ->
+      programTokenize (Text.stripStart chars1)
+    | otherwise ->
+      token : programTokenize chars1
+    where
+      (word, chars1) = Text.break charIsTokenBoundary chars0
+      token
+        | TextCons CharFullStop keyword <- word =
+          TokenKeyword keyword
+        | otherwise =
+          TokenWord word
+
+type BindingSites = Union (Map Name (Seq ()))
+
+type Parsed a = (a, BindingSites, Tokens)
+
+programParse :: ProgramTokenized -> Code ProgramParsed
+programParse = parseAllTerms
+
+parseAllTerms :: (MonadIO m) => Tokens -> m ProgramParsed
+parseAllTerms tokens0
+  | null tokens1 =
+    pure (Block bindings (Expression (Seq terms)))
+  | otherwise =
+    throw ParseError
+  where
+    (terms, sites, tokens1) = parseManyTerms tokens0
+    bindings = bindingsFromSites sites
+
+--  IDEA: Handle duplicate bindings and annotations here.
+bindingsFromSites :: BindingSites -> Bindings
+bindingsFromSites = Map.keysSet . (.union)
+
+parseManyTerms :: Tokens -> Parsed [Term]
+parseManyTerms tokens0 =
+  case Error.runExcept (parseOneTerm tokens0) of
+    Lazy.Left{} ->
+      ([], mempty, tokens0)
+    Lazy.Right (term, sites0, tokens1) ->
+      (term : terms, sites2, tokens2)
+      where
+        ~(terms, sites1, tokens2) = parseManyTerms tokens1
+        sites2 = sites0 <> sites1
+
+parseOneTerm ::
+  (MonadError ParseError m) =>
+  Tokens ->
+  m (Parsed Term)
+parseOneTerm = \case
+  [] -> Error.throwError ParseError
+  token : tokens1 -> case token of
+    TokenKeyword KeywordVar
+      | TokenWord word : tokens2 <- tokens1 -> let
+        name = Name word
+        in pure
+          (
+            TermName name,
+            (Union . Map) [(name, Seq [()])],
+            tokens2
+          )
+      | otherwise -> Error.throwError ParseError
+    TokenKeyword keyword ->
+      Error.throwError ParseError
+    TokenWord word ->
+      pure (term, mempty, tokens1)
+      where
+        term = maybe
+          (TermName (Name word))
+          TermNumber
+          (parseNumber word)
+    TokenText text ->
+      pure (TermText text, mempty, tokens1)
+    TokenGroupBegin -> case tokens2 of
+      TokenGroupEnd : tokens3 ->
+        pure
+          (
+            TermGroup (Expression (Seq terms)),
+            sites,
+            tokens3
+          )
+      _ ->
+        Error.throwError ParseError
+      where
+        (terms, sites, tokens2) = parseManyTerms tokens1
+    TokenGroupEnd ->
+      Error.throwError ParseError
+    TokenBlockBegin -> case tokens2 of
+      TokenBlockEnd : tokens3 ->
+        pure (block, mempty, tokens3)
+        where
+          block = TermBlock
+            (Block bindings (Expression (Seq terms)))
+      _ ->
+        Error.throwError ParseError
+      where
+        (terms, sites, tokens2) = parseManyTerms tokens1
+        bindings = bindingsFromSites sites
+    TokenBlockEnd ->
+      Error.throwError ParseError
+
+parseNumber :: Text -> Maybe Number
+parseNumber word
+  | Lazy.Right (number, TextEmpty) <-
+      Text.Read.signed Text.Read.decimal word =
+    Just number
+  | otherwise =
+    Nothing
 
 data CompileError
   = CompileError
