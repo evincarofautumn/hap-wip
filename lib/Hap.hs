@@ -5,6 +5,7 @@
 {-# Language DuplicateRecordFields #-}
 {-# Language ExplicitNamespaces #-}
 {-# Language GADTs #-}
+{-# Language KindSignatures #-}
 {-# Language LambdaCase #-}
 {-# Language MonadComprehensions #-}
 {-# Language NoFieldSelectors #-}
@@ -13,8 +14,12 @@
 {-# Language OverloadedRecordDot #-}
 {-# Language OverloadedStrings #-}
 {-# Language PatternSynonyms #-}
+{-# Language QuantifiedConstraints #-}
+{-# Language TypeFamilies #-}
 {-# Language TypeOperators #-}
+{-# Language UndecidableInstances #-}
 {-# Language ViewPatterns #-}
+
 {-# Options_ghc -Wno-unused-imports #-}
 
 module Hap (module Hap) where
@@ -29,7 +34,7 @@ import Control.Concurrent.STM.TChan (TChan, writeTChan)
 import Control.Concurrent.STM.TChan qualified as TChan
 import Control.Concurrent.STM.TQueue (TQueue, writeTQueue, flushTQueue)
 import Control.Concurrent.STM.TQueue qualified as TQueue
-import Control.Concurrent.STM.TVar (TVar, modifyTVar', readTVar, stateTVar, writeTVar)
+import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVar, readTVar, stateTVar, writeTVar)
 import Control.Concurrent.STM.TVar qualified as TVar
 import Control.Exception (Exception, SomeException(SomeException), finally, throwIO, try)
 import Control.Exception qualified as Exception
@@ -43,7 +48,7 @@ import Control.Monad.STM (STM, orElse)
 import Control.Monad.STM qualified as STM
 import Control.Monad.State.Strict (MonadState, StateT)
 import Control.Monad.State.Strict qualified as State
-import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.Trans.Maybe (MaybeT(MaybeT, runMaybeT))
 import Control.Monad.Writer (MonadWriter, WriterT)
 import Control.Monad.Writer qualified as Writer
@@ -61,6 +66,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
+import Data.Kind (Constraint, Type)
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -100,7 +106,7 @@ import System.Mem.Weak (Weak, deRefWeak, mkWeakPtr)
 import System.Timeout qualified as Timeout
 
 main :: IO ()
-main = start defaultSettings
+main = startIO defaultSettings
 
 ----------------------------------------------------------------
 
@@ -137,23 +143,23 @@ defaultSettings =
       sources = Seq.Empty
     }
 
-start :: Settings -> IO ()
-start settings = do
+startIO :: Settings -> IO ()
+startIO settings = do
   messages <- messagesNew
-  world <- worldNew
-  compiledPrograms <- hapEval
+  world <- worldNewIO
+  compiledPrograms <- hapEvalIO
     world
     (compileAll settings.sources)
 
   let
     startInput = do
-      hapEval world do
+      hapEvalIO world do
         for_ compiledPrograms void
       exitCode <- case settings.input of
         InputBatch ->
           pure ExitSuccess
         InputInteractive ->
-          consoleRun messages world
+          consoleRunIO messages world
       messagesRequest messages (RequestExit exitCode)
 
     startOutput =
@@ -169,7 +175,7 @@ start settings = do
   exitWith =<< Async.withAsync startInput \_input ->
     startOutput
 
-compileOne :: Source -> Code ProgramCompiled
+compileOne :: Source -> Code IO ProgramCompiled
 compileOne source = do
   loaded <- (cellNew . programLoad) source
   tokenized <- (cellNew . fmap programTokenize . cellGet) loaded
@@ -178,7 +184,7 @@ compileOne source = do
   compiled <- (fmap programCompile . cellGet) checked
   pure compiled
 
-compileAll :: Sources -> Code (Seq ProgramCompiled)
+compileAll :: Sources -> Code IO (Seq ProgramCompiled)
 compileAll sources = do
   loaded <- traverse (cellNew . programLoad) sources
   tokenized <- traverse (cellNew . fmap programTokenize . cellGet) loaded
@@ -339,60 +345,194 @@ eventParse event = case SDL.eventPayload event of
 --  Reactive Cells
 ----------------------------------------------------------------
 
-type Code = CodeT IO
+type Hap :: (Type -> Type) -> Constraint
+class
+  (
+    Monad h,
+    Monad (HapAtomic h)
+  ) => Hap h where
 
-newtype CodeT m a =
-  CodeT {
-    execute :: World -> m (a, Cells)
-  }
+  type family HapAtomic h :: Type -> Type
+  data family HapVar h :: Type -> Type
+  data family HapQueue h :: Type -> Type
+  data family HapBoundedQueue h :: Type -> Type
+  data family HapWeak h :: Type -> Type
+
+  hapAtomic ::
+    Atomic h a ->
+    Code h a
+
+  hapTry ::
+    Code h a ->
+    Code h (Either SomeException (a, Cells h))
+
+  hapThrow ::
+    (Exception e) =>
+    e ->
+    Code h bottom
+
+  hapQueueWrite ::
+    HapQueue h (Code h ()) ->
+    Code h () ->
+    Atomic h ()
+
+  hapQueueFlush ::
+    HapQueue h (Code h ()) ->
+    Atomic h [Code h ()]
+
+  hapVarNew ::
+    a ->
+    Atomic h (HapVar h a)
+
+  hapVarAtomicNew ::
+    a ->
+    Code h (HapVar h a)
+  hapVarAtomicNew = hapAtomic . hapVarNew
+
+  hapVarRead ::
+    HapVar h a ->
+    Atomic h a
+
+  hapVarState ::
+    HapVar h a ->
+    (a -> (b, a)) ->
+    Atomic h b
+
+  hapVarWrite ::
+    HapVar h a ->
+    a ->
+    Atomic h ()
+
+  hapVarModify ::
+    HapVar h a ->
+    (a -> a) ->
+    Atomic h ()
+
+  hapWeakNew ::
+    a ->
+    Code h (HapWeak h a)
+
+  hapStrengthen ::
+    HapWeak h a ->
+    Code h (Maybe a)
+
+type Atomic :: (Type -> Type) -> Type -> Type
+type Atomic h = CodeT h (HapAtomic h)
+
+type Code :: (Type -> Type) -> Type -> Type
+type Code h = CodeT h h
+
+instance Hap IO where
+
+  type instance HapAtomic IO = STM
+
+  newtype instance HapVar IO a =
+    VarIO { var :: TVar a }
+
+  newtype instance HapQueue IO a =
+    QueueIO { queue :: TQueue a }
+
+  newtype instance HapBoundedQueue IO a =
+    BoundedQueueIO { bqueue :: TBQueue a }
+
+  newtype instance HapWeak IO a =
+    WeakIO { weak :: Weak a }
+
+  hapAtomic code =
+    CodeT \world -> atomically (code.execute world)
+
+  hapTry code =
+    CodeT \world -> do
+      results <- try (code.execute world)
+      pure (toStrict results, DList [])
+
+  hapThrow = throw
+
+  hapQueueWrite = fmap lift . writeTQueue . (.queue)
+
+  hapQueueFlush = lift . flushTQueue . (.queue)
+
+  hapVarRead = lift . readTVar . (.var)
+
+  hapVarWrite = fmap lift . writeTVar . (.var)
+
+  hapVarState = fmap lift . stateTVar . (.var)
+
+  hapVarModify = fmap lift . modifyTVar' . (.var)
+
+  hapVarNew = lift . fmap VarIO . newTVar
+
+  hapVarAtomicNew = liftIO . fmap VarIO . newTVarIO
+
+  hapWeakNew = liftIO . fmap WeakIO . (`mkWeakPtr` Lazy.Nothing)
+
+  hapStrengthen = liftIO . fmap toStrict . deRefWeak . (.weak)
+
+type CodeT :: (Type -> Type) -> (Type -> Type) -> Type -> Type
+newtype CodeT h m a where
+  CodeT ::
+    {
+      execute :: World h -> m (a, Cells h)
+    } -> CodeT h m a
   deriving
     (
       Applicative,
       Functor,
       Monad,
       MonadIO,
-      MonadReader World,
-      MonadWriter Cells
-    ) via (ReaderT World (WriterT Cells m))
+      MonadReader (World h),
+      MonadWriter (Cells h)
+    ) via (ReaderT (World h) (WriterT (Cells h) m))
 
-type Cells =
-  DList CellSome
+instance MonadTrans (CodeT h) where
+  lift action = CodeT \_world -> do
+    result <- action
+    pure (result, DList [])
 
-data World =
+type Cells h = DList (CellSome h)
+
+type World :: (Type -> Type) -> Type
+data World h =
   World {
-    allocator :: !IdSource,
-    heap :: !Heap,
-    queue :: !Queue
+    allocator :: !(HapVar h Id),
+    heap :: !(HapVar h (IdMap (CellSome h))),
+    queue :: !(HapQueue h (Code h ()))
   }
   deriving stock (Generic)
 
-type Heap =
-  TVar (IdMap CellSome)
+type CellSome :: (Type -> Type) -> Type
+data CellSome h where
+  CellSome ::
+    {
+      cell :: !(Cell h a)
+    } -> CellSome h
 
-type Queue =
-  TQueue (Code ())
-
-data CellSome where
-  CellSome :: { cell :: !(Cell a) } -> CellSome
-
-instance Show CellSome where
+instance Show (CellSome h) where
   showsPrec p CellSome{} =
     showParen (p >= 10) (showString "CellSome _")
 
-data CellWeak where
-  CellWeak :: { weak :: !(Weak (Cell a)) } -> CellWeak
+type CellWeak :: (Type -> Type) -> Type
+data CellWeak h where
+  CellWeak ::
+    {
+      weak :: !(HapWeak h (Cell h a))
+    } -> CellWeak h
 
-data Cell a =
+type Cell :: (Type -> Type) -> Type -> Type
+data Cell h a =
   Cell {
-    code :: !(TVar (Code a)),
-    getters :: !(TVar (Seq CellWeak)),
-    cache :: !(TVar (Cache a))
+    code :: !(HapVar h (Code h a)),
+    getters :: !(HapVar h (Seq (CellWeak h))),
+    cache :: !(HapVar h (Cache a))
   }
   deriving stock (Generic)
 
-instance Show (Cell a) where
-  showsPrec p Cell { code, getters, cache } =
-    showParen (p >= 10) (showString "Cell _ _ _")
+deriving stock instance
+  (
+    Hap h,
+    forall x. Show (HapVar h x),
+    Show a
+  ) => Show (Cell h a)
 
 data Cache a
   --  IDEA: Split 'CacheFull' to save an indirection.
@@ -405,112 +545,143 @@ type Result =
 
 interpret :: Text -> IO (Maybe Value)
 interpret text = do
-  world <- worldNew
+  world <- worldNewIO
   let
     timeout_s = 2
     micro n = 1e6 * n
   fmap toStrict do
     Timeout.timeout (micro timeout_s) do
-      hapEval world do
+      hapEvalIO world do
         compiled <- compileOne (SourceText text)
         compiled
 
-hapEval :: World -> Code a -> IO a
-hapEval world code = fmap Lazy.fst (code.execute world)
+hapEvalIO :: World IO -> Code IO a -> IO a
+hapEvalIO world code = fmap Lazy.fst (code.execute world)
 
-hapRun :: World -> Code a -> IO (a, Cells)
-hapRun world code = code.execute world
+hapRunIO :: World IO -> Code IO a -> IO (a, Cells IO)
+hapRunIO world code = code.execute world
 
-worldNew :: IO World
-worldNew = do
-  allocator <- idSourceNew
-  heap <- heapNew
-  queue <- queueNew
+worldNewIO :: IO (World IO)
+worldNewIO = do
+  allocator <- idSourceNewIO
+  heap <- heapNewIO
+  queue <- queueNewIO
   pure World { allocator, heap, queue }
 
-heapNew :: IO Heap
-heapNew = newTVarIO idMapEmpty
+heapNewIO :: IO (HapVar IO (IdMap (CellSome IO)))
+heapNewIO = fmap VarIO (newTVarIO idMapEmpty)
 
-queueNew :: IO Queue
-queueNew = newTQueueIO
+queueNewIO :: IO (HapQueue IO (Code IO ()))
+queueNewIO = fmap QueueIO newTQueueIO
 
-enqueue :: Code () -> Code ()
+enqueue ::
+  (Hap h) =>
+  Code h () ->
+  Code h ()
 enqueue action = do
   queue <- Reader.asks (.queue)
-  atomically do
-    writeTQueue queue action
+  hapAtomic do
+    hapQueueWrite queue action
 
-flush :: Code ()
+flush ::
+  (Hap h) =>
+  Code h ()
 flush = do
   queue <- Reader.asks (.queue)
-  actions <- atomically do
-    flushTQueue queue
+  actions <- hapAtomic do
+    hapQueueFlush queue
   sequenceA_ actions
 
-notifyPut :: Cell a -> Code ()
+notifyPut ::
+  (Hap h) =>
+  Cell h a ->
+  Code h ()
 notifyPut =
   traverse_
     (traverse_ (\CellSome { cell } -> notifyPut cell) <=<
       cellStrengthen) <=<
-  (atomically . readTVar) .
+  (hapAtomic . hapVarRead) .
   (.getters)
 
-cellStrengthen :: CellWeak -> Code (Maybe CellSome)
+cellStrengthen ::
+  (Hap h) =>
+  CellWeak h ->
+  Code h (Maybe (CellSome h))
 cellStrengthen CellWeak { weak } =
-  fmap (fmap CellSome . toStrict) (liftIO (deRefWeak weak))
+  fmap (fmap CellSome) (hapStrengthen weak)
 
-cellGet :: Cell a -> Code a
-cellGet cell = CodeT \world ->
-  liftIO =<< atomically do
-    cache <- readTVar cell.cache
+cellGet ::
+  (Hap h) =>
+  Cell h a ->
+  Code h a
+cellGet cell = do
+  continue <- hapAtomic do
+    cache <- hapVarRead cell.cache
     case cache of
-      CacheFull (Right value) -> do
-        pure (pure (value, DList [CellSome cell]))
-      CacheFull (Left error) -> do
-        pure (throwIO error)
+      CacheFull (Right value) -> pure do
+        Writer.tell (DList [CellSome cell])
+        pure value
+      CacheFull (Left error) -> pure do
+        hapThrow error
       CacheEmpty -> do
-        writeTVar cell.cache CacheFilling
-        code <- readTVar cell.code
+        hapVarWrite cell.cache CacheFilling
+        code <- hapVarRead cell.code
         pure do
-          result <- try (code.execute world)
+          result <- hapTry code
           case result of
-            Lazy.Left error -> do
-              atomically do
-                writeTVar cell.cache (CacheFull (Left error))
-              throwIO error
-            Lazy.Right (value, putters) -> do
+            Left error -> do
+              hapAtomic do
+                hapVarWrite cell.cache (CacheFull (Left error))
+              hapThrow error
+            Right (value, putters) -> do
               getter <- cellWeakNew cell
-              atomically do
-                writeTVar cell.cache (CacheFull (Right value))
+              hapAtomic do
+                hapVarWrite cell.cache (CacheFull (Right value))
                 for_ putters \(CellSome putter) ->
-                  modifyTVar' putter.getters (getter :<|)
-              pure (value, DList [CellSome cell])
-      CacheFilling ->
-        pure (throwIO (Cycle (CellSome cell)))
+                  hapVarModify putter.getters (getter :<|)
+              Writer.tell (DList [CellSome cell])
+              pure value
+      CacheFilling -> pure do
+        hapThrow Cycle
+  continue
 
-cellPut :: Cell a -> Code a -> Code ()
+cellPut ::
+  (Hap h) =>
+  Cell h a ->
+  Code h a ->
+  Code h ()
 cellPut cell code = do
-  atomically do
-    writeTVar cell.code code
+  hapAtomic do
+    hapVarWrite cell.code code
   notifyPut cell
 
-data Cycle = Cycle !CellSome
+data Cycle
+  = Cycle
   deriving anyclass (Exception)
   deriving stock (Show)
 
-cellOf :: a -> Code (Cell a)
+cellOf ::
+  (Hap h) =>
+  a ->
+  Code h (Cell h a)
 cellOf = cellNew . pure
 
-cellNew :: Code a -> Code (Cell a)
+cellNew ::
+  (Hap h) =>
+  Code h a ->
+  Code h (Cell h a)
 cellNew = fmap (.withoutId) . cellNewWithId
 
-cellNewWithId :: Code a -> Code (WithId (Cell a))
+cellNewWithId ::
+  (Hap h) =>
+  Code h a ->
+  Code h (WithId (Cell h a))
 cellNewWithId code0 = do
   allocator <- Reader.asks (.allocator)
-  id <- liftIO (idNew allocator)
-  code <- newTVarIO code0
-  getters <- newTVarIO Seq.Empty
-  cache <- newTVarIO CacheEmpty
+  id <- idNew allocator
+  code <- hapVarAtomicNew code0
+  getters <- hapVarAtomicNew Seq.Empty
+  cache <- hapVarAtomicNew CacheEmpty
   let
     cell =
       Cell {
@@ -520,12 +691,13 @@ cellNewWithId code0 = do
       }
   do
     heap <- Reader.asks (.heap)
-    atomically (modifyTVar' heap (idMapInsert id (CellSome cell)))
+    hapAtomic do
+      hapVarModify heap
+        (idMapInsert id (CellSome cell))
   pure WithId { id, withoutId = cell }
 
-cellWeakNew :: (MonadIO m) => Cell a -> m CellWeak
-cellWeakNew cell =
-  fmap CellWeak (liftIO (mkWeakPtr cell Lazy.Nothing))
+cellWeakNew :: (Hap h) => Cell h a -> Code h (CellWeak h)
+cellWeakNew cell = fmap CellWeak (hapWeakNew cell)
 
 ----------------------------------------------------------------
 --  Cell IDs
@@ -562,14 +734,12 @@ newtype IdSet =
   }
   deriving stock (Generic, Show)
 
-type IdSource = TVar Id
+idSourceNewIO :: IO (HapVar IO Id)
+idSourceNewIO = fmap VarIO (newTVarIO (Id 0))
 
-idSourceNew :: IO IdSource
-idSourceNew = newTVarIO (Id 0)
-
-idNew :: (MonadIO m) => IdSource -> m Id
-idNew source = atomically do
-  stateTVar source next
+idNew :: (Hap h) => HapVar h Id -> Code h Id
+idNew source = hapAtomic do
+  hapVarState source next
   where
     next id0 = (id0, id1)
       where
@@ -583,11 +753,11 @@ data Console =
   Console {
     messages :: !Messages,
     inputState :: !Haskeline.IO.InputState,
-    world :: !World
+    world :: !(World IO)
   }
 
-consoleRun :: Messages -> World -> IO ExitCode
-consoleRun messages world = do
+consoleRunIO :: Messages -> World IO -> IO ExitCode
+consoleRunIO messages world = do
   inputState <- Haskeline.IO.initializeInput
     Haskeline.defaultSettings
   let console = Console { messages, inputState, world }
@@ -612,8 +782,9 @@ consoleLoop = do
           consoleLoop
       Lazy.Nothing -> do
         world <- Reader.asks (.world)
-        result <- liftIO
-          (hapEval world (join (compileOne (SourceText line))))
+        result <- liftIO do
+          hapEvalIO world do
+            join (compileOne (SourceText line))
         consoleOutput (Text (show result))
         consoleLoop
 
@@ -824,8 +995,8 @@ prettyText =
 type ProgramLoaded = Text
 type ProgramTokenized = Tokens
 type ProgramParsed = Parsed Block
-type ProgramChecked = Checked Block
-type ProgramCompiled = Code Value
+type ProgramChecked = Checked IO Block
+type ProgramCompiled = Code IO Value
 
 type Tokens = [Token]
 
@@ -853,34 +1024,44 @@ data Term annotation where
   TermBlock :: !a -> !(Block a) -> Term a
   deriving stock (Generic, Show)
 
---  IDEA: Use 'Id' instead of 'Cell' so 'Obj' is 'Show'.
-data Obj
+type Obj :: (Type -> Type) -> Type
+data Obj h
   = ObjObj
-  | ObjArr !Arr
+  | ObjArr !(Arr h)
   deriving stock (Generic)
 
---  IDEA: Use 'Id' instead of 'Cell' so 'Objs' is 'Show'.
-data Objs
+deriving stock instance
+  (
+    Hap h,
+    forall x. Show (HapVar h x)
+  ) => Show (Obj h)
+
+type Objs :: (Type -> Type) -> Type
+data Objs h
   = ObjsNil
-  | ObjsCons !(Cell (Maybe Obj)) !(Cell (Maybe Objs))
+  | ObjsCons
+    !(Cell h (Maybe (Obj h)))
+    !(Cell h (Maybe (Objs h)))
   deriving stock (Generic)
 
---  IDEA: Use 'Id' instead of 'Cell' so 'ArrMut' is 'Show'.
-data Arr
+deriving stock instance
+  (
+    Hap h,
+    forall x. Show (HapVar h x)
+  ) => Show (Objs h)
+
+type Arr :: (Type -> Type) -> Type
+data Arr h
   = Arr {
-    input, output :: !(Cell (Maybe Objs))
+    input, output :: !(Cell h (Maybe (Objs h)))
   }
   deriving stock (Generic)
 
-instance Show Arr where
-  showsPrec p Arr { input, output } =
-    showParen (p >= 10)
-      (
-        showString "Arr " .
-        showsPrec 10 input .
-        showString " " .
-        showsPrec 10 output
-      )
+deriving stock instance
+  (
+    Hap h,
+    forall x. Show (HapVar h x)
+  ) => Show (Arr h)
 
 data Value
   = ValueNumber !Number
@@ -913,7 +1094,7 @@ data ParseError
   deriving anyclass (Exception)
   deriving stock (Generic, Show)
 
-programLoad :: Source -> Code ProgramLoaded
+programLoad :: Source -> Code IO ProgramLoaded
 programLoad = \case
   SourcePath path ->
     fmap Text.Encoding.decodeUtf8 do
@@ -966,7 +1147,7 @@ type ParseResult a = (a, BindingSites, Tokens)
 
 type BindingSites = Union (Map Name (Seq ()))
 
-programParse :: ProgramTokenized -> Code ProgramParsed
+programParse :: ProgramTokenized -> Code IO ProgramParsed
 programParse = parseAllTerms
 
 parseAllTerms :: (MonadIO m) => Tokens -> m ProgramParsed
@@ -1062,22 +1243,27 @@ parseNumber word
 --  Checking
 ----------------------------------------------------------------
 
-type Checked f = f Arr
+type Checked ::
+  (Type -> Type) ->
+  (Type -> Type) ->
+  Type
+type Checked h f = f (Arr h)
 
 data CheckError
   = CheckError
   deriving anyclass (Exception)
   deriving stock (Generic, Show)
 
-type WithArr = (:!:) Arr
+type WithArr h = (:!:) (Arr h)
 
-programCheck :: ProgramParsed -> Code ProgramChecked
-programCheck = fmap snd . checkBlock (mempty :: Checked Scope)
+programCheck :: ProgramParsed -> Code IO ProgramChecked
+programCheck =
+  fmap snd . checkBlock (mempty :: Checked IO Scope)
 
 checkBlock ::
-  Checked Scope ->
+  Checked IO Scope ->
   Parsed Block ->
-  Code (WithArr (Checked Block))
+  Code IO (WithArr IO (Checked IO Block))
 checkBlock scope0 block = do
   scope <- fmap Map do
     for (Map.toList block.scope) checkBinding
@@ -1092,7 +1278,7 @@ checkBlock scope0 block = do
   flush
   pure (arr :!: Block { scope, body })
 
-checkBinding :: (Name, ()) -> Code (Name, Arr)
+checkBinding :: (Name, ()) -> Code IO (Name, Arr IO)
 checkBinding (name, ()) = do
   arr <- Arr
     <$> cellOf Nothing
@@ -1101,9 +1287,9 @@ checkBinding (name, ()) = do
 
 --  IDEA: Memoize to avoid allocating a lot of new cells.
 checkTerm ::
-  Checked Scope ->
+  Checked IO Scope ->
   Parsed Term ->
-  Code (WithArr (Checked Term))
+  Code IO (WithArr IO (Checked IO Term))
 checkTerm scope0 = \case
   TermName () name -> do
     arr <- checkName scope0 name
@@ -1135,9 +1321,9 @@ checkTerm scope0 = \case
     pure (arr1 :!: TermBlock arr1 block1)
 
 checkExpression ::
-  Checked Scope ->
+  Checked IO Scope ->
   Parsed Expression ->
-  Code (WithArr (Checked Expression))
+  Code IO (WithArr IO (Checked IO Expression))
 checkExpression scope0 expression = do
   terms1 <- for expression.terms (checkTerm scope0)
   flush
@@ -1153,7 +1339,7 @@ checkExpression scope0 expression = do
   flush
   pure (arr :!: Expression (fmap snd terms1))
 
-checkCompose :: Arr -> Arr -> Code Arr
+checkCompose :: Arr IO -> Arr IO -> Code IO (Arr IO)
 checkCompose consumer producer = do
   input0 <- cellGet consumer.input
   output0 <- cellGet producer.output
@@ -1166,7 +1352,7 @@ checkCompose consumer producer = do
       output = consumer.output
     }
 
-checkObjs :: Objs -> Objs -> Code ()
+checkObjs :: Objs IO -> Objs IO -> Code IO ()
 checkObjs ObjsNil ObjsNil = pure ()
 checkObjs (ObjsCons x xs) (ObjsCons y ys) = do
   checkMaybe checkObj x y
@@ -1176,8 +1362,8 @@ checkObjs (ObjsCons x xs) (ObjsCons y ys) = do
 checkObjs _ _ = throw CheckError
 
 checkMaybe ::
-  (a -> a -> Code ()) ->
-  Cell (Maybe a) -> Cell (Maybe a) -> Code ()
+  (a -> a -> Code IO ()) ->
+  Cell IO (Maybe a) -> Cell IO (Maybe a) -> Code IO ()
 checkMaybe check x y = do
   x1 <- cellGet x
   y1 <- cellGet y
@@ -1194,7 +1380,7 @@ checkMaybe check x y = do
     (Nothing, Nothing) ->
       pure ()
 
-checkObj :: Obj -> Obj -> Code ()
+checkObj :: Obj IO -> Obj IO -> Code IO ()
 checkObj ObjObj ObjObj = pure ()
 checkObj (ObjArr leftArr) (ObjArr rightArr) = do
   checkArr leftArr rightArr
@@ -1202,7 +1388,7 @@ checkObj (ObjArr leftArr) (ObjArr rightArr) = do
 --  IDEA: Unify 'Obj' with 'Arr' from unit?
 checkObj _ _ = throw CheckError
 
-checkArr :: Arr -> Arr -> Code ()
+checkArr :: Arr IO -> Arr IO -> Code IO ()
 checkArr
   (Arr leftInput leftOutput)
   (Arr rightInput rightOutput) = do
@@ -1211,7 +1397,7 @@ checkArr
   checkMaybe checkObjs leftOutput rightOutput
   flush
 
-checkName :: Checked Scope -> Name -> Code Arr
+checkName :: Checked IO Scope -> Name -> Code IO (Arr IO)
 checkName scope name = case Map.lookup name scope of
   Lazy.Just arr -> pure arr
   Lazy.Nothing -> throw CheckError
@@ -1225,12 +1411,12 @@ data CompileError
   deriving anyclass (Exception)
   deriving stock (Generic, Show)
 
-type CompileScope = Map Name (Cell Value)
+type CompileScope = Map Name (Cell IO Value)
 
 programCompile :: ProgramChecked -> ProgramCompiled
 programCompile = compileBlock (mempty :: CompileScope)
 
-compileBlock :: CompileScope -> Checked Block -> Code Value
+compileBlock :: CompileScope -> Checked IO Block -> Code IO Value
 compileBlock scope0 block = do
   scope1 <- fmap Map do
     for (Map.toList block.scope) compileBinding
@@ -1244,13 +1430,13 @@ compileBlock scope0 block = do
   compileExpression scope2 block.body
 
 compileBinding ::
-  (Name, Arr) ->
-  Code (Name, Cell Value)
+  (Name, Arr IO) ->
+  Code IO (Name, Cell IO Value)
 compileBinding (name, _type) = do
   cell <- cellNew (throw Uninitialized)
   pure (name, cell)
 
-compileTerm :: CompileScope -> Checked Term -> Code Value
+compileTerm :: CompileScope -> Checked IO Term -> Code IO Value
 compileTerm scope0 = \case
   TermName _object name -> compileName scope0 name
   TermVar _object name -> compileName scope0 name
@@ -1259,10 +1445,10 @@ compileTerm scope0 = \case
   TermBlock _object block -> compileBlock scope0 block
 
 compileExpression ::
-  CompileScope -> Checked Expression -> Code Value
+  CompileScope -> Checked IO Expression -> Code IO Value
 compileExpression scope0 expression = undefined
 
-compileName :: CompileScope -> Name -> Code Value
+compileName :: CompileScope -> Name -> Code IO Value
 compileName scope name = case Map.lookup name scope of
   Lazy.Just cell -> cellGet cell
   Lazy.Nothing -> throw CompileError
