@@ -560,36 +560,31 @@ data Cache a
 interpret :: Text -> IO (Maybe Value)
 interpret text = do
   world <- worldNew
-  let
-    timeout_s = 2
-    micro n = 1e6 * n
+  let timeout_s = 2
   fmap toStrict do
     Timeout.timeout (micro timeout_s) do
       codeRun world do
         compiled <- compileOne text
         compiled
 
+micro :: (Num a) => a -> a
+micro = (* 1e6)
+
 codeRun :: World -> Code a -> IO a
 codeRun world code0 = do
-  hPutStrLn stderr "codeRun: begin"
   resultVar <- varNewFrom world.idSource throwUninitialized
   results <- loop [Put code0 resultVar]
-  hPutStrLn stderr "codeRun: end"
   case results of
     Right [] -> do
-      hPutStrLn stderr "codeRun: queue empty"
       store <- atomically (readTVar resultVar.store)
       case store of
         StoreFull (Right result) -> do
-          hPutStrLn stderr "codeRun: got result"
           pure result
         StoreFull (Left error) -> do
-          hPutStrLn stderr "codeRun: got error"
           throw error
         StoreEmpty -> throw (Error "result empty (not begun)")
         StoreFilling -> throw (Error "result empty (not done)")
     Left error -> do
-      hPutStrLn stderr "codeRun: no result"
       throw error
     Right _queue -> throw (Error "ended with work left")
 
@@ -597,7 +592,6 @@ codeRun world code0 = do
 
     loop :: [Put] -> IO (Result [Put])
     loop (Put code var : queue0) = do
-      hPutStrLn stderr "codeRun: loop"
       answers <- try (code.run world)
       case answers of
         Lazy.Left error
@@ -605,21 +599,17 @@ codeRun world code0 = do
               fromException error ->
             throw error
           | otherwise -> do
-            hPutStrLn stderr "codeRun: failure"
             pure (Left error)
         Lazy.Right (AnsNow result) -> do
-          hPutStrLn stderr "codeRun: result"
           _ans <- (varPutResult var result).run world
           pure case result of
             Left error -> Left error
             Right{} -> Right queue0
         Lazy.Right (AnsGet (Get forResult useResult)) -> do
-          hPutStrLn stderr "codeRun: blocked"
           varListen forResult
             (Put (useRun useResult =<< varGet forResult) var)
           loop queue0
     loop [] = do
-      hPutStrLn stderr "codeRun: repeat"
       queue <- atomically do
         flushTQueue world.queue
       if null queue then pure (Right []) else loop queue
@@ -814,10 +804,19 @@ consoleLoop = do
           consoleLoop
       Lazy.Nothing -> do
         world <- Reader.asks (.world)
-        result <- liftIO do
-          codeRun world do
-            join (compileOne line)
-        consoleOutput (Text (show result))
+        results <- fmap toStrict do
+          liftIO do
+            try @SomeException do
+              let timeout_s = 2
+              fmap toStrict do
+                Timeout.timeout (micro timeout_s) do
+                  codeRun world do
+                    join (compileOne line)
+        consoleOutput case results of
+          Right (Just result) -> Text (show result)
+          Right Nothing -> "timed out"
+          Left error ->
+            Text (Exception.displayException error)
         consoleLoop
 
 consoleInput :: String -> Consoled (Lazy.Maybe Text)
