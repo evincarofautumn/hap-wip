@@ -1,5 +1,6 @@
 {-# Language BlockArguments #-}
 {-# Language DeriveAnyClass #-}
+{-# Language DefaultSignatures #-}
 {-# Language DerivingStrategies #-}
 {-# Language DerivingVia #-}
 {-# Language DuplicateRecordFields #-}
@@ -43,7 +44,7 @@ import Control.Concurrent.STM.TQueue (TQueue, writeTQueue, flushTQueue)
 import Control.Concurrent.STM.TQueue qualified as TQueue
 import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVar, readTVar, stateTVar, writeTVar)
 import Control.Concurrent.STM.TVar qualified as TVar
-import Control.Exception (Exception(fromException, toException), SomeAsyncException(..), SomeException(..), finally, throwIO, try)
+import Control.Exception (Exception(displayException, fromException, toException), SomeAsyncException(..), SomeException(..), finally, throwIO, try)
 import Control.Exception qualified as Exception
 import Control.Monad ((<=<), join, void, when)
 import Control.Monad.Except (MonadError, ExceptT, throwError, tryError)
@@ -91,7 +92,7 @@ import Data.Text.Encoding qualified as Text.Encoding
 import Data.Text.IO qualified as Text.IO
 import Data.Text.Read qualified as Text.Read
 import Data.Traversable (for)
-import Data.Void (Void)
+import Data.Void (Void, absurd, vacuous)
 import Data.Word (Word8)
 import GHC.Generics (Generic)
 import GHC.Exts (IsString)
@@ -99,11 +100,11 @@ import GHC.Exts qualified
 import GHC.Natural (Natural)
 import Optics ((%~))
 import Optics qualified
-import Prelude hiding (Either(..), Maybe(..), Word, (.), error, fst, id, lines, maybe, snd, uncurry)
+import Prelude hiding (Either(..), Maybe(..), Word, (.), error, exp, fst, id, lines, maybe, snd, uncurry)
 import Prelude qualified
 import Prelude qualified as Lazy (Either(..), Maybe(..), fst, snd, uncurry)
-import Prettyprinter (Pretty(pretty))
-import Prettyprinter qualified
+import Prettyprinter (Pretty(pretty), hcat, hsep, hang, sep, vcat, vsep)
+import Prettyprinter qualified as Pretty
 import Prettyprinter.Render.Text qualified
 import SDL (($=))
 import SDL qualified
@@ -373,6 +374,9 @@ newtype Code a
     run :: World -> IO (Ans a)
   }
 
+instance Debug (Code a) where
+  debug _ = "⟨code⟩"
+
 instance Functor Code where
   fmap f code = Code (fmap (fmap f) . code.run)
 
@@ -433,8 +437,7 @@ instance Applicative Code where
             --  The function is unknown:
             --  make a variable to track it.
             Get forF useF -> do
-              varF <- varNewFrom world.idSource do
-                throwUninitialized
+              varF <- varNewUninitialized world
               let put = Put (useRun useF =<< varGet forF) varF
               varListen forF put
               getApply varF
@@ -496,10 +499,58 @@ instance MonadIO Code where
 
 data World
   = World {
-    idSource :: !IdSource,
+    next :: !(TVar Id),
+    heap :: !(TVar Heap),
     queue :: !(TQueue Put)
   }
   deriving stock (Generic)
+
+worldSnap :: World -> STM WorldSnap
+worldSnap world = do
+  next <- readTVar world.next
+  heap <- heapSnap =<< readTVar world.heap
+  --  TODO: queue
+  pure WorldSnap { next, heap }
+
+heapSnap :: Heap -> STM HeapSnap
+heapSnap heap =
+  fmap IdMap (traverse (someTraverse varSnap) heap.map)
+
+varSnap :: Var a -> STM (VarSnap a)
+varSnap var = do
+  store <- readTVar var.store
+  pure VarSnap { id = var.id, store }
+
+data WorldSnap
+  = WorldSnap {
+    next :: !Id,
+    heap :: !HeapSnap
+    --  TODO: queue
+  }
+  deriving stock (Generic)
+
+instance Debug WorldSnap where
+  debug world =
+    vsep [
+      "world snapshot",
+      hsep [
+        "*",
+        sep ["next:", debug world.next]
+      ],
+      hsep [
+        "*",
+        vsep [
+          "heap:",
+          hang 4 (debug world.heap)
+        ]
+      ]
+    ]
+
+type Heap =
+  IdMap (Some Var)
+
+type HeapSnap =
+  IdMap (Some VarSnap)
 
 data Ans a
   = AnsNow !(Result a)
@@ -544,18 +595,110 @@ data Var a =
   }
   deriving stock (Generic)
 
+instance Debug (Var a) where
+  debug var = debug var.id
+
+data VarSnap a =
+  VarSnap {
+    id :: Id,
+    --  TODO: code
+    store :: !(Store a)
+    --  TODO: getters
+  }
+  deriving stock (Generic, Show)
+
+instance (Debug a) => Debug (VarSnap a) where
+  debug var =
+    vsep [
+      hsep ["*", sep [hcat ["id", ":"], debug var.id]],
+      hsep ["*", sep [hcat ["store", ":"], debug var.store]]
+    ]
+
+class Debug a where
+  debug :: a -> Doc
+  --  default debug :: (Pretty a) => a -> Doc
+  --  debug = pretty
+
+dbg :: (Debug a) => a -> Pretty.Doc ann
+dbg = vacuous . debug
+
+instance Debug Int where
+  debug = pretty
+
+instance Debug Text where
+  debug = pretty
+
+instance Debug () where
+  debug = pretty
+
+instance (Debug a, Debug b) => Debug (a, b) where
+  debug (a, b) = sep [hcat [debug a, ","], debug b]
+
+instance (Debug a) => Debug (Maybe a) where
+  debug = debug . Foldable.toList
+
+instance (Debug a) => Debug [a] where
+  debug = pretty . fmap (prettyText . debug)
+
+instance (Debug a) => Debug (Seq a) where
+  debug = debug . Foldable.toList
+
+instance (Debug k, Debug v) => Debug (Map k v) where
+  debug = debug . Map.toList
+
+instance Debug (a -> b) where
+  debug _ = "⟨function⟩"
+
+data Some f where
+  Some :: (Debug a) => !(f a) -> Some f
+
+instance
+  (
+    forall x. (Debug x) => Debug (f x)
+  ) => Debug (Some f) where
+  debug (Some f) = debug f
+
+someMap ::
+  (forall x. f x -> g x) ->
+  Some f ->
+  Some g
+someMap n (Some f) = Some (n f)
+
+someTraverse ::
+  (Functor m) =>
+  (forall x. f x -> m (g x)) ->
+  Some f ->
+  m (Some g)
+someTraverse n (Some f) = fmap Some (n f)
+
 type Result = Either SomeException
 
 data Store a
   = StoreFull !(Result a)
   | StoreEmpty
   | StoreFilling
+  deriving stock (Generic, Show)
+
+instance (Debug a) => Debug (Store a) where
+  debug = \case
+    StoreFull (Right result) ->
+      sep [hcat ["full", ":"], debug result]
+    StoreFull (Left error) ->
+      sep [
+        hcat ["full", ":"],
+        debug (Text (displayException error))
+      ]
+    StoreEmpty ->
+      "empty"
+    StoreFilling ->
+      "filling"
 
 data Cache a
   --  IDEA: Split 'CacheFull' to save an indirection.
   = CacheFull !(Result a)
   | CacheEmpty
   | CacheFilling
+  deriving stock (Generic, Show)
 
 interpret :: Text -> IO (Maybe Value)
 interpret text = do
@@ -570,9 +713,9 @@ interpret text = do
 micro :: (Num a) => a -> a
 micro = (* 1e6)
 
-codeRun :: World -> Code a -> IO a
+codeRun :: (Debug a) => World -> Code a -> IO a
 codeRun world code0 = do
-  resultVar <- varNewFrom world.idSource throwUninitialized
+  resultVar <- varNewUninitialized world
   results <- loop [Put code0 resultVar]
   case results of
     Right [] -> do
@@ -616,12 +759,15 @@ codeRun world code0 = do
 
 worldNew :: IO World
 worldNew = do
-  idSource <- idSourceNew
+  next <- newTVarIO (Id 0)
+  heap <- heapNew
   queue <- newTQueueIO
-  pure World { idSource, queue }
+  pure World { next, heap, queue }
+
+heapNew :: IO (TVar Heap)
+heapNew = newTVarIO idMapEmpty
 
 flush :: Code ()
---  flush = pure ()
 flush = do
   queue <- Reader.asks (.queue)
   actions <- atomically do
@@ -682,24 +828,30 @@ varPutLazy var code = do
     for_ getters (writeTQueue queue)
 
 varOf ::
+  (Debug a) =>
   a ->
   Code (Var a)
 varOf = varNew . pure
 
 varNew ::
+  (Debug a) =>
   Code a ->
   Code (Var a)
 varNew code = do
-  idSource <- Reader.asks (.idSource)
+  world <- Reader.ask
   liftIO do
-    varNewFrom idSource code
+    varNewFrom world code
+
+varNewUninitialized :: (Debug a) => World -> IO (Var a)
+varNewUninitialized world = varNewFrom world throwUninitialized
 
 varNewFrom ::
-  IdSource ->
+  (Debug a) =>
+  World ->
   Code a ->
   IO (Var a)
-varNewFrom idSource code0 = do
-  id <- idNew idSource
+varNewFrom world code0 = do
+  id <- idNew world.next
   code <- newTVarIO code0
   getters <- newTVarIO []
   store <- newTVarIO StoreEmpty
@@ -711,6 +863,8 @@ varNewFrom idSource code0 = do
         getters,
         store
       }
+  atomically do
+    modifyTVar' world.heap (idMapInsert id (Some var))
   pure var
 
 varListen :: Var a -> Put -> IO ()
@@ -725,6 +879,9 @@ newtype Id = Id { number :: Nat }
   deriving newtype (Enum)
   deriving stock (Generic, Show)
 
+instance Debug Id where
+  debug id = "#" <> pretty id.number
+
 data WithId a =
   WithId {
     id :: Id,
@@ -732,12 +889,18 @@ data WithId a =
   }
   deriving stock (Generic, Show)
 
-{-
 newtype IdMap a =
   IdMap {
     map :: IntMap a
   }
   deriving stock (Generic, Show)
+
+instance (Debug a) => Debug (IdMap a) where
+  debug ids =
+    vsep [
+      hsep ["*", sep [hcat [debug k, ":"], hang 4 (debug v)]]
+      | (k, v) <- IntMap.toList ids.map
+    ]
 
 idMapEmpty :: IdMap a
 idMapEmpty = IdMap IntMap.empty
@@ -752,14 +915,8 @@ newtype IdSet =
     set :: IntSet
   }
   deriving stock (Generic, Show)
--}
 
-type IdSource = TVar Id
-
-idSourceNew :: IO IdSource
-idSourceNew = newTVarIO (Id 0)
-
-idNew :: IdSource -> IO Id
+idNew :: TVar Id -> IO Id
 idNew source = atomically do
   stateTVar source next
   where
@@ -799,6 +956,11 @@ consoleLoop = do
       Lazy.Just comment -> case parseCommand comment of
         Just CommandQuit ->
           pure ExitSuccess
+        Just CommandVars -> do
+          world <- atomically . worldSnap =<<
+            Reader.asks (.world)
+          consoleOutput (prettyText (debug world))
+          consoleLoop
         Nothing -> do
           consoleOutput "unknown command"
           consoleLoop
@@ -816,7 +978,7 @@ consoleLoop = do
           Right (Just result) -> Text (show result)
           Right Nothing -> "timed out"
           Left error ->
-            Text (Exception.displayException error)
+            Text (displayException error)
         consoleLoop
 
 consoleInput :: String -> Consoled (Lazy.Maybe Text)
@@ -843,11 +1005,13 @@ commentPrefix = "//"
 
 data Command
   = CommandQuit
+  | CommandVars
   deriving stock (Generic, Show)
 
 parseCommand :: Text -> Maybe Command
 parseCommand input0 = case Text.strip input0 of
   "quit" -> Just CommandQuit
+  "vars" -> Just CommandVars
   _ -> Nothing
 
 ----------------------------------------------------------------
@@ -1012,12 +1176,12 @@ throw = liftIO . throwIO
 --  Pretty Printing
 ----------------------------------------------------------------
 
-type Doc = Prettyprinter.Doc Void
+type Doc = Pretty.Doc Void
 
 prettyText :: Doc -> Text
 prettyText =
   Prettyprinter.Render.Text.renderStrict .
-  Prettyprinter.layoutPretty Prettyprinter.defaultLayoutOptions
+  Pretty.layoutPretty Pretty.defaultLayoutOptions
 
 ----------------------------------------------------------------
 --  Programs
@@ -1041,9 +1205,38 @@ data Token
   | TokenBlockEnd
   deriving stock (Generic, Show)
 
+instance Debug Token where
+  debug = \case
+    TokenWord word ->
+      pretty word
+    TokenKeyword keyword ->
+      hcat [pretty CharFullStop, pretty keyword]
+    TokenText text ->
+      hcat [
+        pretty CharQuotationMark,
+        pretty text,
+        pretty CharQuotationMark
+      ]
+    TokenGroupBegin ->
+      pretty CharLeftParenthesis
+    TokenGroupEnd ->
+      pretty CharRightParenthesis
+    TokenBlockBegin ->
+      pretty CharLeftCurlyBracket
+    TokenBlockEnd ->
+      pretty CharRightCurlyBracket
+
 newtype Expression annotation where
   Expression :: { terms :: Terms a } -> Expression a
   deriving stock (Generic, Show)
+
+instance (Debug a) => Debug (Expression a) where
+  debug exp =
+    hcat [
+      pretty CharLeftParenthesis,
+      sep (fmap debug (Foldable.toList exp.terms)),
+      pretty CharRightParenthesis
+    ]
 
 type Terms a = Seq (Term a)
 
@@ -1055,11 +1248,32 @@ data Term annotation where
   TermBlock :: !a -> !(Block a) -> Term a
   deriving stock (Generic, Show)
 
+instance (Debug a) => Debug (Term a) where
+  debug = \case
+    TermName _ann name ->
+      debug name
+    TermVar _ann name ->
+      sep [
+        hcat [pretty CharFullStop, pretty KeywordVar],
+        debug name
+      ]
+    TermValue value ->
+      debug value
+    TermGroup _ann exp ->
+      debug exp
+    TermBlock _ann block ->
+      debug block
+
 type Obj :: Type
 data Obj
   = ObjObj
   | ObjArr !Arr
   deriving stock (Generic)
+
+instance Debug Obj where
+  debug = \case
+    ObjObj -> "*"
+    ObjArr arr -> debug arr
 
 type Objs :: Type
 data Objs
@@ -1069,6 +1283,11 @@ data Objs
     !(Var (Maybe Objs))
   deriving stock (Generic)
 
+instance Debug Objs where
+  debug = \case
+    ObjsNil -> "·"
+    ObjsCons o os -> sep [hcat [debug o, ","], debug os]
+
 type Arr :: Type
 data Arr
   = Arr {
@@ -1076,10 +1295,17 @@ data Arr
   }
   deriving stock (Generic)
 
+instance Debug Arr where
+  debug arr =
+    sep [hsep [debug arr.input, "->"], debug arr.output]
+
 data Value
   = ValueNumber !Number
   | ValueText !Text
   deriving stock (Generic, Show)
+
+instance Debug Value where
+  debug = Pretty.viaShow
 
 data Uninitialized
   = Uninitialized
@@ -1094,11 +1320,21 @@ data Block annotation where
     } -> Block a
   deriving stock (Generic, Show)
 
+instance (Debug a) => Debug (Block a) where
+  debug block =
+    sep [
+      "[", debug block.scope, "]",
+      "{", debug block.body, "}"
+    ]
+
 type Scope = Map Name
 
 newtype Name =
   Name { spelling :: Text }
   deriving stock (Eq, Generic, Ord, Show)
+
+instance Debug Name where
+  debug = pretty . (.spelling)
 
 type Number = Integer
 
