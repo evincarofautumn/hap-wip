@@ -70,6 +70,7 @@ import Data.Foldable (for_, sequenceA_, toList, traverse_)
 import Data.Foldable qualified as Foldable (toList)
 import Data.Function ((&), on)
 import Data.Functor.Compose (Compose(Compose, getCompose))
+import Data.Functor.Identity (Identity(Identity, runIdentity))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
@@ -112,6 +113,7 @@ import System.Console.Haskeline qualified as Haskeline
 import System.Console.Haskeline.IO qualified as Haskeline.IO
 import System.Exit (ExitCode(..), exitWith)
 import System.IO (hPrint, hPutStrLn, stderr)
+import System.Mem.Weak (Weak)
 import System.Mem.Weak qualified as Weak
 import System.Timeout qualified as Timeout
 
@@ -453,6 +455,12 @@ throwUninitialized ::
 throwUninitialized =
   throwError (toException (Error "uninitialized"))
 
+throwUnsolved ::
+  (MonadError SomeException m) =>
+  m bottom
+throwUnsolved =
+  throwError (toException (Error "unsolved"))
+
 throwCycle ::
   (MonadError SomeException m) =>
   m bottom
@@ -505,16 +513,20 @@ data World
   }
   deriving stock (Generic)
 
-worldSnap :: World -> STM WorldSnap
+worldSnap :: (MonadIO m) => World -> m WorldSnap
 worldSnap world = do
-  next <- readTVar world.next
-  heap <- heapSnap =<< readTVar world.heap
+  next :!: heap0 <- atomically do
+    liftA2 (:!:) (readTVar world.next) (readTVar world.heap)
+  heap <- heapSnap heap0
   --  TODO: queue
   pure WorldSnap { next, heap }
 
-heapSnap :: Heap -> STM HeapSnap
-heapSnap heap =
-  fmap IdMap (traverse (someTraverse varSnap) heap.map)
+heapSnap :: (MonadIO m) => Heap -> m HeapSnap
+heapSnap heap = do
+  vars <- IntMap.traverseMaybeWithKey
+    (const (liftIO . Weak.deRefWeak))
+    heap.map
+  fmap IdMap (atomically (traverse (someTraverse varSnap) vars))
 
 varSnap :: Var a -> STM (VarSnap a)
 varSnap var = do
@@ -547,7 +559,7 @@ instance Debug WorldSnap where
     ]
 
 type Heap =
-  IdMap (Some Var)
+  IdMap (Weak (Some Var))
 
 type HeapSnap =
   IdMap (Some VarSnap)
@@ -633,6 +645,9 @@ instance Debug () where
 
 instance (Debug a, Debug b) => Debug (a, b) where
   debug (a, b) = sep [hcat [debug a, ","], debug b]
+
+instance (Debug a) => Debug (Identity a) where
+  debug = debug . runIdentity
 
 instance (Debug a) => Debug (Maybe a) where
   debug = debug . Foldable.toList
@@ -863,8 +878,11 @@ varNewFrom world code0 = do
         getters,
         store
       }
-  atomically do
-    modifyTVar' world.heap (idMapInsert id (Some var))
+  let delete = modifyTVar' world.heap (idMapDelete id)
+  weak <- Weak.mkWeakPtr (Some var)
+    (Lazy.Just (atomically delete))
+  let insert = modifyTVar' world.heap (idMapInsert id weak)
+  atomically insert
   pure var
 
 varListen :: Var a -> Put -> IO ()
@@ -901,6 +919,11 @@ instance (Debug a) => Debug (IdMap a) where
       hsep ["*", sep [hcat [debug k, ":"], hang 4 (debug v)]]
       | (k, v) <- IntMap.toList ids.map
     ]
+
+idMapDelete :: Id -> IdMap a -> IdMap a
+idMapDelete id ids =
+  ids & #map %~
+    IntMap.delete (fromIntegral id.number)
 
 idMapEmpty :: IdMap a
 idMapEmpty = IdMap IntMap.empty
@@ -957,8 +980,7 @@ consoleLoop = do
         Just CommandQuit ->
           pure ExitSuccess
         Just CommandVars -> do
-          world <- atomically . worldSnap =<<
-            Reader.asks (.world)
+          world <- worldSnap =<< Reader.asks (.world)
           consoleOutput (prettyText (debug world))
           consoleLoop
         Nothing -> do
@@ -1190,6 +1212,7 @@ prettyText =
 type ProgramLoaded = Text
 type ProgramTokenized = Tokens
 type ProgramParsed = Parsed Block
+type ProgramChecking = Checking Block
 type ProgramChecked = Checked Block
 type ProgramCompiled = Code Value
 
@@ -1228,7 +1251,14 @@ instance Debug Token where
 
 newtype Expression annotation where
   Expression :: { terms :: Terms a } -> Expression a
-  deriving stock (Generic, Show)
+  deriving stock
+    (
+      Foldable,
+      Functor,
+      Generic,
+      Show,
+      Traversable
+    )
 
 instance (Debug a) => Debug (Expression a) where
   debug exp =
@@ -1246,7 +1276,14 @@ data Term annotation where
   TermValue :: !Value -> Term a
   TermGroup :: !a -> !(Expression a) -> Term a
   TermBlock :: !a -> !(Block a) -> Term a
-  deriving stock (Generic, Show)
+  deriving stock
+    (
+      Foldable,
+      Functor,
+      Generic,
+      Show,
+      Traversable
+    )
 
 instance (Debug a) => Debug (Term a) where
   debug = \case
@@ -1264,38 +1301,45 @@ instance (Debug a) => Debug (Term a) where
     TermBlock _ann block ->
       debug block
 
-type Obj :: Type
-data Obj
+type Obj :: (Type -> Type) -> Type
+data Obj var
   = ObjObj
-  | ObjArr !Arr
+  | ObjArr !(Arr var)
   deriving stock (Generic)
 
-instance Debug Obj where
+instance
+  (
+    forall x. (Debug x) => Debug (var x)
+  ) => Debug (Obj var) where
   debug = \case
     ObjObj -> "*"
     ObjArr arr -> debug arr
 
-type Objs :: Type
-data Objs
+type Objs :: (Type -> Type) -> Type
+data Objs var
   = ObjsNil
-  | ObjsCons
-    !(Var (Maybe Obj))
-    !(Var (Maybe Objs))
+  | ObjsCons !(var (Obj var)) !(var (Objs var))
   deriving stock (Generic)
 
-instance Debug Objs where
+instance
+  (
+    forall x. (Debug x) => Debug (var x)
+  ) => Debug (Objs var) where
   debug = \case
     ObjsNil -> "·"
     ObjsCons o os -> sep [hcat [debug o, ","], debug os]
 
-type Arr :: Type
-data Arr
+type Arr :: (Type -> Type) -> Type
+data Arr var
   = Arr {
-    input, output :: !(Var (Maybe Objs))
+    input, output :: !(var (Objs var))
   }
   deriving stock (Generic)
 
-instance Debug Arr where
+instance
+  (
+    forall x. (Debug x) => Debug (var x)
+  ) => Debug (Arr var) where
   debug arr =
     sep [hsep [debug arr.input, "->"], debug arr.output]
 
@@ -1318,7 +1362,14 @@ data Block annotation where
       scope :: !(Scope a),
       body :: !(Expression a)
     } -> Block a
-  deriving stock (Generic, Show)
+  deriving stock
+    (
+      Foldable,
+      Functor,
+      Generic,
+      Show,
+      Traversable
+    )
 
 instance (Debug a) => Debug (Block a) where
   debug block =
@@ -1494,18 +1545,60 @@ parseNumber word
 ----------------------------------------------------------------
 
 type Checked :: (Type -> Type) -> Type
-type Checked f = f Arr
+type Checked f = f (Arr Identity)
 
-type WithArr = (:!:) Arr
+type Checking :: (Type -> Type) -> Type
+type Checking f = f (Arr Meta)
+
+type Meta :: Type -> Type
+newtype Meta a = Meta { var :: Var (Maybe a) }
+  deriving newtype (Debug)
+
+metaNewOf :: (Debug a) => a -> Code (Meta a)
+metaNewOf = fmap Meta . varOf . Just
+
+metaNewEmpty :: (Debug a) => Code (Meta a)
+metaNewEmpty = fmap Meta (varOf Nothing)
+
+type WithArr = (:!:) (Arr Meta)
 
 programCheck :: ProgramParsed -> Code ProgramChecked
 programCheck =
-  fmap snd . checkBlock (mempty :: Checked Scope)
+  traverse checkedArr <=<
+  fmap snd .
+  checkBlock (mempty :: Checking Scope)
+
+checkedArr :: Arr Meta -> Code (Arr Identity)
+checkedArr arr =
+  Arr
+    <$> checkedMetaWith (fmap Identity . checkedObjs) arr.input
+    <*> checkedMetaWith (fmap Identity . checkedObjs) arr.output
+
+checkedObjs :: Objs Meta -> Code (Objs Identity)
+checkedObjs = \case
+  ObjsNil -> pure ObjsNil
+  ObjsCons obj objs ->
+    ObjsCons
+      <$> checkedMetaWith (fmap Identity . checkedObj) obj
+      <*> checkedMetaWith (fmap Identity . checkedObjs) objs
+
+checkedObj :: Obj Meta -> Code (Obj Identity)
+checkedObj = \case
+  ObjObj -> pure ObjObj
+  ObjArr arr ->
+    ObjArr <$> checkedArr arr
+
+checkedMetaWith ::
+  (f Meta -> Code (Identity (f Identity))) ->
+  Meta (f Meta) ->
+  Code (Identity (f Identity))
+checkedMetaWith f meta =
+  maybe throwUnsolved f =<< varGet meta.var
 
 checkBlock ::
-  Checked Scope ->
+  Checking Scope ->
   Parsed Block ->
-  Code (WithArr (Checked Block))
+  Code (WithArr (Checking Block))
 checkBlock scope0 block = do
   scope <- fmap Map do
     for (Map.toList block.scope) checkBinding
@@ -1520,18 +1613,16 @@ checkBlock scope0 block = do
   flush
   pure (arr :!: Block { scope, body })
 
-checkBinding :: (Name, ()) -> Code (Name, Arr)
+checkBinding :: (Name, ()) -> Code (Name, Arr Meta)
 checkBinding (name, ()) = do
-  arr <- Arr
-    <$> varOf Nothing
-    <*> varOf Nothing
+  arr <- liftA2 Arr metaNewEmpty metaNewEmpty
   pure (name, arr)
 
 --  IDEA: Memoize to avoid allocating a lot of new vars.
 checkTerm ::
-  Checked Scope ->
+  Checking Scope ->
   Parsed Term ->
-  Code (WithArr (Checked Term))
+  Code (WithArr (Checking Term))
 checkTerm scope0 = \case
   TermName () name -> do
     arr <- checkName scope0 name
@@ -1543,9 +1634,9 @@ checkTerm scope0 = \case
     pure (arr :!: TermVar arr name)
   TermValue value -> do
     arr <- do
-      obj <- varOf (Just ObjObj)
-      input <- varOf Nothing
-      output <- varOf (Just (ObjsCons obj input))
+      obj <- metaNewOf ObjObj
+      input <- metaNewEmpty
+      output <- metaNewOf (ObjsCons obj input)
       pure Arr { input, output }
     pure (arr :!: TermValue value)
   TermGroup () body0 -> do
@@ -1556,21 +1647,21 @@ checkTerm scope0 = \case
     arr0 :!: block1 <- checkBlock scope0 block0
     flush
     arr1 <- do
-      obj <- varOf (Just (ObjArr arr0))
-      input <- varOf Nothing
-      output <- varOf (Just (ObjsCons obj input))
+      obj <- Meta <$> varOf (Just (ObjArr arr0))
+      input <- Meta <$> varOf Nothing
+      output <- Meta <$> varOf (Just (ObjsCons obj input))
       pure Arr { input, output }
     pure (arr1 :!: TermBlock arr1 block1)
 
 checkExpression ::
-  Checked Scope ->
+  Checking Scope ->
   Parsed Expression ->
-  Code (WithArr (Checked Expression))
+  Code (WithArr (Checking Expression))
 checkExpression scope0 expression = do
   terms1 <- for expression.terms (checkTerm scope0)
   flush
   identityArr <- do
-    objs <- varOf Nothing
+    objs <- Meta <$> varOf Nothing
     pure (Arr objs objs)
   arr <- (`State.execStateT` identityArr) do
     for_ terms1 \(producerArr :!: _producer) -> do
@@ -1581,10 +1672,10 @@ checkExpression scope0 expression = do
   flush
   pure (arr :!: Expression (fmap snd terms1))
 
-checkCompose :: Arr -> Arr -> Code Arr
+checkCompose :: Arr Meta -> Arr Meta -> Code (Arr Meta)
 checkCompose consumer producer = do
-  input0 <- varGet consumer.input
-  output0 <- varGet producer.output
+  input0 <- varGet consumer.input.var
+  output0 <- varGet producer.output.var
   for_ ((liftA2 (,) `on` toLazy) input0 output0)
     (Lazy.uncurry checkObjs)
   flush
@@ -1594,7 +1685,7 @@ checkCompose consumer producer = do
       output = consumer.output
     }
 
-checkObjs :: Objs -> Objs -> Code ()
+checkObjs :: Objs Meta -> Objs Meta -> Code ()
 checkObjs ObjsNil ObjsNil = pure ()
 checkObjs (ObjsCons x xs) (ObjsCons y ys) = do
   checkMaybe checkObj x y
@@ -1606,26 +1697,26 @@ checkObjs _ _ =
 
 checkMaybe ::
   (a -> a -> Code ()) ->
-  Var (Maybe a) ->
-  Var (Maybe a) ->
+  Meta a ->
+  Meta a ->
   Code ()
 checkMaybe check x y = do
-  x1 <- varGet x
-  y1 <- varGet y
+  x1 <- varGet x.var
+  y1 <- varGet y.var
   case (x1, y1) of
     (Just x2, Just y2) -> do
       check x2 y2
       flush
     (Nothing, y2@Just{}) -> do
-      varPutResult x (Right y2)
+      varPutResult x.var (Right y2)
       flush
     (x2@Just{}, Nothing) -> do
-      varPutResult y (Right x2)
+      varPutResult y.var (Right x2)
       flush
     (Nothing, Nothing) ->
       pure ()
 
-checkObj :: Obj -> Obj -> Code ()
+checkObj :: Obj Meta -> Obj Meta -> Code ()
 checkObj ObjObj ObjObj = pure ()
 checkObj (ObjArr leftArr) (ObjArr rightArr) = do
   checkArr leftArr rightArr
@@ -1634,7 +1725,7 @@ checkObj (ObjArr leftArr) (ObjArr rightArr) = do
 checkObj _ _ =
   throwError (toException (Error "object and arrow"))
 
-checkArr :: Arr -> Arr -> Code ()
+checkArr :: Arr Meta -> Arr Meta -> Code ()
 checkArr
   (Arr leftInput leftOutput)
   (Arr rightInput rightOutput) = do
@@ -1643,7 +1734,7 @@ checkArr
   checkMaybe checkObjs leftOutput rightOutput
   flush
 
-checkName :: Checked Scope -> Name -> Code Arr
+checkName :: Checking Scope -> Name -> Code (Arr Meta)
 checkName scope name = case Map.lookup name scope of
   Lazy.Just arr -> pure arr
   Lazy.Nothing ->
@@ -1672,7 +1763,7 @@ compileBlock scope0 block = do
   compileExpression scope2 block.body
 
 compileBinding ::
-  (Name, Arr) ->
+  (Name, Arr Identity) ->
   Code (Name, Var Value)
 compileBinding (name, _type) = do
   var <- varNew do
@@ -1691,7 +1782,11 @@ compileExpression ::
   CompileScope ->
   Checked Expression ->
   Code Value
-compileExpression scope0 expression = undefined
+compileExpression scope0 expression = do
+  loop [] (Foldable.toList expression.terms)
+  where
+    loop stack (term : terms) = undefined
+    loop stack [] = undefined
 
 compileName ::
   CompileScope ->
