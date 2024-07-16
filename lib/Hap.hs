@@ -28,6 +28,36 @@
 
 module Hap (module Hap) where
 
+import Prelude hiding
+  (
+    Either(..),
+    Maybe(..),
+    Word,
+    (.),
+    error,
+    exp,
+    fst,
+    head,
+    id,
+    init,
+    last,
+    lines,
+    maybe,
+    snd,
+    tail,
+    uncurry,
+  )
+import Prelude qualified
+import Prelude qualified as Lazy
+  (
+    Either(..),
+    Maybe(..),
+    fst,
+    maybe,
+    snd,
+    uncurry,
+  )
+
 import Control.Arrow (Arrow)
 import Control.Arrow qualified as Arrow
 import Control.Category (Category, (.), (>>>))
@@ -46,11 +76,11 @@ import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVar, readTVar, stateT
 import Control.Concurrent.STM.TVar qualified as TVar
 import Control.Exception (Exception(displayException, fromException, toException), SomeAsyncException(..), SomeException(..), finally, throwIO, try)
 import Control.Exception qualified as Exception
-import Control.Monad ((<=<), join, void, when)
+import Control.Monad ((<=<), (>=>), join, void, when)
 import Control.Monad.Except (MonadError, ExceptT, throwError, tryError)
 import Control.Monad.Except qualified as Error
 import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.Reader (MonadReader, ReaderT)
+import Control.Monad.Reader (MonadReader, ReaderT(runReaderT))
 import Control.Monad.Reader qualified as Reader
 import Control.Monad.STM (STM, orElse)
 import Control.Monad.STM qualified as STM
@@ -66,12 +96,13 @@ import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DList
 import Data.Either qualified as Lazy (partitionEithers)
-import Data.Foldable (for_, sequenceA_, toList, traverse_)
+import Data.Foldable (fold, for_, sequenceA_, toList, traverse_)
 import Data.Foldable qualified as Foldable (toList)
 import Data.Function ((&), on)
 import Data.Functor.Compose (Compose(Compose, getCompose))
 import Data.Functor.Identity (Identity(Identity, runIdentity))
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef)
+import Data.IORef qualified as IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
@@ -79,6 +110,7 @@ import Data.Kind (Constraint, Type)
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Semigroup (Last(Last, getLast))
 import Data.Sequence (Seq((:<|), (:|>)))
 import Data.Sequence qualified as Seq
 import Data.Set (Set)
@@ -101,9 +133,6 @@ import GHC.Exts qualified
 import GHC.Natural (Natural)
 import Optics ((%~))
 import Optics qualified
-import Prelude hiding (Either(..), Maybe(..), Word, (.), error, exp, fst, id, lines, maybe, snd, uncurry)
-import Prelude qualified
-import Prelude qualified as Lazy (Either(..), Maybe(..), fst, snd, uncurry)
 import Prettyprinter (Pretty(pretty), hcat, hsep, hang, sep, vcat, vsep)
 import Prettyprinter qualified as Pretty
 import Prettyprinter.Render.Text qualified
@@ -191,20 +220,18 @@ compileOne ::
   ProgramLoaded ->
   Code ProgramCompiled
 compileOne loaded = do
-  tokenized <- (varNew . pure . programTokenize) loaded
-  parsed <- (varNew . (programParse <=< varGet)) tokenized
-  checked <- (varNew . (programCheck <=< varGet)) parsed
-  compiled <- (fmap programCompile . varGet) checked
+  tokenized <- (varNewStrict . pure . programTokenize) loaded
+  parsed <- (varNewStrict . (programParse <=< varGet)) tokenized
+  compiled <- (programCompile <=< varGet) parsed
   pure compiled
 
 compileAll ::
   Seq ProgramLoaded ->
   Code (Seq ProgramCompiled)
 compileAll loaded = do
-  tokenized <- traverse (varNew . pure . programTokenize) loaded
-  parsed <- traverse (varNew . (programParse <=< varGet)) tokenized
-  checked <- traverse (varNew . (programCheck <=< varGet)) parsed
-  compiled <- traverse (fmap programCompile . varGet) checked
+  tokenized <- traverse (varNewStrict . pure . programTokenize) loaded
+  parsed <- traverse (varNewStrict . (programParse <=< varGet)) tokenized
+  compiled <- traverse (programCompile <=< varGet) parsed
   pure compiled
 
 ----------------------------------------------------------------
@@ -509,17 +536,34 @@ data World
   = World {
     next :: !(TVar Id),
     heap :: !(TVar Heap),
+    scope :: !(IORef CompileScope),
+    stack :: !(IORef [Var Value]),
     queue :: !(TQueue Put)
   }
   deriving stock (Generic)
+
+stackPush :: Var Value -> Code ()
+stackPush value = do
+  stack <- Reader.asks (.stack)
+  modifyIORef' stack (value :)
+
+stackPop :: Code (Var Value)
+stackPop = do
+  stack <- Reader.asks (.stack)
+  readIORef stack >>= \case
+    [] -> throwError (toException (Error "underflow"))
+    top : down -> do
+      writeIORef stack down
+      pure top
 
 worldSnap :: (MonadIO m) => World -> m WorldSnap
 worldSnap world = do
   next :!: heap0 <- atomically do
     liftA2 (:!:) (readTVar world.next) (readTVar world.heap)
   heap <- heapSnap heap0
+  stack <- stackSnap =<< readIORef world.stack
   --  TODO: queue
-  pure WorldSnap { next, heap }
+  pure WorldSnap { next, heap, stack }
 
 heapSnap :: (MonadIO m) => Heap -> m HeapSnap
 heapSnap heap = do
@@ -527,6 +571,9 @@ heapSnap heap = do
     (const (liftIO . Weak.deRefWeak))
     heap.map
   fmap IdMap (atomically (traverse (someTraverse varSnap) vars))
+
+stackSnap :: (MonadIO m) => [Var Value] -> m [VarSnap Value]
+stackSnap = atomically . traverse varSnap
 
 varSnap :: Var a -> STM (VarSnap a)
 varSnap var = do
@@ -536,7 +583,8 @@ varSnap var = do
 data WorldSnap
   = WorldSnap {
     next :: !Id,
-    heap :: !HeapSnap
+    heap :: !HeapSnap,
+    stack :: ![VarSnap Value]
     --  TODO: queue
   }
   deriving stock (Generic)
@@ -554,6 +602,13 @@ instance Debug WorldSnap where
         vsep [
           "heap:",
           hang 4 (debug world.heap)
+        ]
+      ],
+      hsep [
+        "*",
+        vsep [
+          "stack:",
+          hang 4 (debug world.stack)
         ]
       ]
     ]
@@ -600,7 +655,8 @@ instance Arrow Use where
 
 data Var a =
   Var {
-    id :: Id,
+    id :: !Id,
+    strat :: !Strat,
     code :: !(TVar (Code a)),
     store :: !(TVar (Store a)),
     getters :: !(TVar [Put])
@@ -610,9 +666,18 @@ data Var a =
 instance Debug (Var a) where
   debug var = debug var.id
 
+data Strat
+  = StratLazy
+  | StratStrict
+
+instance Debug Strat where
+  debug = \case
+    StratLazy -> "lazy"
+    StratStrict -> "strict"
+
 data VarSnap a =
   VarSnap {
-    id :: Id,
+    id :: !Id,
     --  TODO: code
     store :: !(Store a)
     --  TODO: getters
@@ -715,7 +780,7 @@ data Cache a
   | CacheFilling
   deriving stock (Generic, Show)
 
-interpret :: Text -> IO (Maybe Value)
+interpret :: Text -> IO (Maybe ())
 interpret text = do
   world <- worldNew
   let timeout_s = 2
@@ -727,6 +792,23 @@ interpret text = do
 
 micro :: (Num a) => a -> a
 micro = (* 1e6)
+
+codeTry ::
+  (Debug a, MonadIO m) =>
+  World ->
+  Code a ->
+  m (Result a)
+codeTry world code = fmap (toStrict . join) do
+  liftIO do
+    try @SomeException do
+      let timeout_s = 2
+      fmap
+        (Lazy.maybe
+          (Lazy.Left (toException (Error "timed out")))
+          Lazy.Right)
+        do
+          Timeout.timeout (micro timeout_s) do
+            codeRun world code
 
 codeRun :: (Debug a) => World -> Code a -> IO a
 codeRun world code0 = do
@@ -776,8 +858,10 @@ worldNew :: IO World
 worldNew = do
   next <- newTVarIO (Id 0)
   heap <- heapNew
+  scope <- IORef.newIORef (mempty :: CompileScope)
+  stack <- IORef.newIORef []
   queue <- newTQueueIO
-  pure World { next, heap, queue }
+  pure World { next, heap, scope, stack, queue }
 
 heapNew :: IO (TVar Heap)
 heapNew = newTVarIO idMapEmpty
@@ -805,7 +889,7 @@ varGet var = (join . atomically) do
       pure do
         result <- tryError code
         case result of
-          Lazy.Left error@(fromException -> Lazy.Just (_ :: Error)) -> do
+          Lazy.Left error -> do
             atomically do
               writeTVar var.store (StoreFull (Left error))
             throwError error
@@ -846,34 +930,52 @@ varOf ::
   (Debug a) =>
   a ->
   Code (Var a)
-varOf = varNew . pure
+varOf = varNew StratStrict . pure
 
 varNew ::
   (Debug a) =>
+  Strat ->
   Code a ->
   Code (Var a)
-varNew code = do
+varNew strat code = do
   world <- Reader.ask
   liftIO do
-    varNewFrom world code
+    varNewFrom world strat code
+
+varNewStrict ::
+  (Debug a) =>
+  Code a ->
+  Code (Var a)
+varNewStrict = varNew StratStrict
+
+varNewLazy ::
+  (Debug a) =>
+  Code a ->
+  Code (Var a)
+varNewLazy = varNew StratLazy
 
 varNewUninitialized :: (Debug a) => World -> IO (Var a)
-varNewUninitialized world = varNewFrom world throwUninitialized
+varNewUninitialized world =
+  varNewFrom world StratLazy throwUninitialized
 
 varNewFrom ::
   (Debug a) =>
   World ->
+  Strat ->
   Code a ->
   IO (Var a)
-varNewFrom world code0 = do
+varNewFrom world strat code0 = do
   id <- idNew world.next
   code <- newTVarIO code0
   getters <- newTVarIO []
-  store <- newTVarIO StoreEmpty
+  store <- newTVarIO =<< case strat of
+    StratLazy -> pure StoreEmpty
+    StratStrict -> fmap StoreFull (codeTry world code0)
   let
     var =
       Var {
         id,
+        strat,
         code,
         getters,
         store
@@ -963,7 +1065,7 @@ consoleRun messages world = do
   inputState <- Haskeline.IO.initializeInput
     Haskeline.defaultSettings
   let console = Console { messages, inputState, world }
-  Reader.runReaderT consoleLoop console
+  runReaderT consoleLoop console
     `finally` Haskeline.IO.cancelInput inputState
 
 type Consoled = ReaderT Console IO
@@ -988,17 +1090,10 @@ consoleLoop = do
           consoleLoop
       Lazy.Nothing -> do
         world <- Reader.asks (.world)
-        results <- fmap toStrict do
-          liftIO do
-            try @SomeException do
-              let timeout_s = 2
-              fmap toStrict do
-                Timeout.timeout (micro timeout_s) do
-                  codeRun world do
-                    join (compileOne line)
+        results <- codeTry world do
+          join (compileOne line)
         consoleOutput case results of
-          Right (Just result) -> Text (show result)
-          Right Nothing -> "timed out"
+          Right result -> Text (show result)
           Left error ->
             Text (displayException error)
         consoleLoop
@@ -1058,8 +1153,14 @@ pattern CharLeftParenthesis = '\x0028'
 pattern CharRightParenthesis :: Char
 pattern CharRightParenthesis = '\x0029'
 
+pattern CharComma :: Char
+pattern CharComma = '\x002C'
+
 pattern CharFullStop :: Char
 pattern CharFullStop = '\x002E'
+
+pattern CharSemicolon :: Char
+pattern CharSemicolon = '\x003B'
 
 pattern CharLeftCurlyBracket :: Char
 pattern CharLeftCurlyBracket = '\x007B'
@@ -1078,6 +1179,10 @@ charIsTokenBoundary = \case
   CharQuotationMark -> True
   CharLeftParenthesis -> True
   CharRightParenthesis -> True
+  CharComma -> True
+  CharSemicolon -> True
+  CharLeftCurlyBracket -> True
+  CharRightCurlyBracket -> True
   char
     | Char.isSpace char -> True
   _ -> False
@@ -1176,6 +1281,9 @@ adjacentMaybe = \case
 atomically :: (MonadIO m) => STM a -> m a
 atomically = liftIO . STM.atomically
 
+modifyIORef' :: (MonadIO m) => IORef a -> (a -> a) -> m ()
+modifyIORef' = fmap liftIO . IORef.modifyIORef
+
 newTBQueueIO :: (MonadIO m) => Natural -> m (TBQueue a)
 newTBQueueIO = liftIO . TBQueue.newTBQueueIO
 
@@ -1188,11 +1296,17 @@ newTQueueIO = liftIO TQueue.newTQueueIO
 newTVarIO :: (MonadIO m) => a -> m (TVar a)
 newTVarIO = liftIO . TVar.newTVarIO
 
+readIORef :: (MonadIO m) => IORef a -> m a
+readIORef = liftIO . IORef.readIORef
+
 readTVarIO :: (MonadIO m) => TVar a -> m a
 readTVarIO = liftIO . TVar.readTVarIO
 
 throw :: (Exception e, MonadIO m) => e -> m z
 throw = liftIO . throwIO
+
+writeIORef :: (MonadIO m) => IORef a -> a -> m ()
+writeIORef = fmap liftIO . IORef.writeIORef
 
 ----------------------------------------------------------------
 --  Pretty Printing
@@ -1212,9 +1326,7 @@ prettyText =
 type ProgramLoaded = Text
 type ProgramTokenized = Tokens
 type ProgramParsed = Parsed Block
-type ProgramChecking = Checking Block
-type ProgramChecked = Checked Block
-type ProgramCompiled = Code Value
+type ProgramCompiled = Code ()
 
 type Tokens = [Token]
 
@@ -1226,6 +1338,8 @@ data Token
   | TokenGroupEnd
   | TokenBlockBegin
   | TokenBlockEnd
+  | TokenExpressionSeparator
+  | TokenStatementSeparator
   deriving stock (Generic, Show)
 
 instance Debug Token where
@@ -1248,6 +1362,10 @@ instance Debug Token where
       pretty CharLeftCurlyBracket
     TokenBlockEnd ->
       pretty CharRightCurlyBracket
+    TokenExpressionSeparator ->
+      pretty CharComma
+    TokenStatementSeparator ->
+      pretty CharSemicolon
 
 newtype Expression annotation where
   Expression :: { terms :: Terms a } -> Expression a
@@ -1259,6 +1377,10 @@ newtype Expression annotation where
       Show,
       Traversable
     )
+
+type Expressions a = Seq (Expression a)
+
+type Statement = Expression
 
 instance (Debug a) => Debug (Expression a) where
   debug exp =
@@ -1344,12 +1466,21 @@ instance
     sep [hsep [debug arr.input, "->"], debug arr.output]
 
 data Value
-  = ValueNumber !Number
+  = ValueNone
+  | ValueNumber !Number
   | ValueText !Text
   deriving stock (Generic, Show)
 
 instance Debug Value where
-  debug = Pretty.viaShow
+  debug = \case
+    ValueNone -> "none"
+    ValueNumber number -> pretty number
+    ValueText text ->
+      hcat [
+        pretty CharQuotationMark,
+        pretty text,
+        pretty CharQuotationMark
+      ]
 
 data Uninitialized
   = Uninitialized
@@ -1360,7 +1491,7 @@ data Block annotation where
   Block ::
     {
       scope :: !(Scope a),
-      body :: !(Expression a)
+      body :: !(Expressions a)
     } -> Block a
   deriving stock
     (
@@ -1375,7 +1506,12 @@ instance (Debug a) => Debug (Block a) where
   debug block =
     sep [
       "[", debug block.scope, "]",
-      "{", debug block.body, "}"
+      "{",
+      sep [
+        hcat [debug statement, ";"]
+        | statement <- Foldable.toList block.body
+      ],
+      "}"
     ]
 
 type Scope = Map Name
@@ -1413,6 +1549,8 @@ programTokenize = \case
       matchPunctuation = \case
         CharLeftParenthesis -> Just TokenGroupBegin
         CharRightParenthesis -> Just TokenGroupEnd
+        CharComma -> Just TokenExpressionSeparator
+        CharSemicolon -> Just TokenStatementSeparator
         CharLeftCurlyBracket -> Just TokenBlockBegin
         CharRightCurlyBracket -> Just TokenBlockEnd
         _ -> Nothing
@@ -1445,24 +1583,48 @@ type BindingSites = Union (Map Name (Seq ()))
 programParse ::
   ProgramTokenized ->
   Code ProgramParsed
-programParse = parseAllTerms
+programParse = parseAllStatements
 
-parseAllTerms ::
+parseAllStatements ::
   (MonadError SomeException m) =>
   Tokens ->
   m ProgramParsed
-parseAllTerms tokens0
+parseAllStatements tokens0
   | null tokens1 =
-    pure (Block scope (Expression (Seq terms)))
+    pure Block { scope, body = Seq statements }
   | otherwise =
     throwError (toException (Error "missing end of input"))
   where
-    (terms, sites, tokens1) = parseManyTerms tokens0
+    (statements, sites, tokens1) = parseManyStatements tokens0
     scope = scopeFromSites sites
 
 --  IDEA: Handle duplicate bindings and annotations here.
 scopeFromSites :: BindingSites -> Parsed Scope
 scopeFromSites = void . (.union)
+
+parseManyStatements :: Tokens -> ParseResult [Parsed Statement]
+parseManyStatements tokens0
+  | null statement.terms = ([], sites0, tokens1)
+  | otherwise = case tokens1 of
+    TokenStatementSeparator : tokens2 ->
+      (statement : statements, sites0 <> sites1, tokens3)
+      where
+        ~(statements, sites1, tokens3) =
+          parseManyStatements tokens2
+    tokens2 ->
+      (
+        [statement],
+        sites0,
+        tokens2
+      )
+  where
+    ~(statement, sites0, tokens1) = parseExpression tokens0
+
+parseExpression :: Tokens -> ParseResult (Parsed Expression)
+parseExpression tokens0 =
+  (Expression (Seq terms), sites, tokens1)
+  where
+    ~(terms, sites, tokens1) = parseManyTerms tokens0
 
 parseManyTerms :: Tokens -> ParseResult [Parsed Term]
 parseManyTerms tokens0 =
@@ -1523,14 +1685,19 @@ parseOneTerm = \case
         pure (block, mempty, tokens3)
         where
           block = TermBlock ()
-            (Block scope (Expression (Seq terms)))
+            (Block scope (Seq statements))
       _ ->
         throwError (toException (Error "missing block end"))
       where
-        (terms, sites, tokens2) = parseManyTerms tokens1
+        ~(statements, sites, tokens2) =
+          parseManyStatements tokens1
         scope = scopeFromSites sites
     TokenBlockEnd ->
       throwError (toException (Error "unmatched block end"))
+    TokenExpressionSeparator ->
+      throwError (toException (Error "misplaced expression separator"))
+    TokenStatementSeparator ->
+      throwError (toException (Error "misplaced statement separator"))
 
 parseNumber :: Text -> Maybe Number
 parseNumber word
@@ -1541,259 +1708,89 @@ parseNumber word
     Nothing
 
 ----------------------------------------------------------------
---  Checking
-----------------------------------------------------------------
-
-type Checked :: (Type -> Type) -> Type
-type Checked f = f (Arr Identity)
-
-type Checking :: (Type -> Type) -> Type
-type Checking f = f (Arr Meta)
-
-type Meta :: Type -> Type
-newtype Meta a = Meta { var :: Var (Maybe a) }
-  deriving newtype (Debug)
-
-metaNewOf :: (Debug a) => a -> Code (Meta a)
-metaNewOf = fmap Meta . varOf . Just
-
-metaNewEmpty :: (Debug a) => Code (Meta a)
-metaNewEmpty = fmap Meta (varOf Nothing)
-
-type WithArr = (:!:) (Arr Meta)
-
-programCheck :: ProgramParsed -> Code ProgramChecked
-programCheck =
-  traverse checkedArr <=<
-  fmap snd .
-  checkBlock (mempty :: Checking Scope)
-
-checkedArr :: Arr Meta -> Code (Arr Identity)
-checkedArr arr =
-  Arr
-    <$> checkedMetaWith (fmap Identity . checkedObjs) arr.input
-    <*> checkedMetaWith (fmap Identity . checkedObjs) arr.output
-
-checkedObjs :: Objs Meta -> Code (Objs Identity)
-checkedObjs = \case
-  ObjsNil -> pure ObjsNil
-  ObjsCons obj objs ->
-    ObjsCons
-      <$> checkedMetaWith (fmap Identity . checkedObj) obj
-      <*> checkedMetaWith (fmap Identity . checkedObjs) objs
-
-checkedObj :: Obj Meta -> Code (Obj Identity)
-checkedObj = \case
-  ObjObj -> pure ObjObj
-  ObjArr arr ->
-    ObjArr <$> checkedArr arr
-
-checkedMetaWith ::
-  (f Meta -> Code (Identity (f Identity))) ->
-  Meta (f Meta) ->
-  Code (Identity (f Identity))
-checkedMetaWith f meta =
-  maybe throwUnsolved f =<< varGet meta.var
-
-checkBlock ::
-  Checking Scope ->
-  Parsed Block ->
-  Code (WithArr (Checking Block))
-checkBlock scope0 block = do
-  scope <- fmap Map do
-    for (Map.toList block.scope) checkBinding
-  let
-    -- IDEA: Allow shadowing to be a warning.
-    scope1 = Map.unionWithKey
-      (\key _old _new ->
-        Prelude.error ("shadowed variable: " <> show key))
-      scope0
-      scope
-  arr :!: body <- checkExpression scope1 block.body
-  flush
-  pure (arr :!: Block { scope, body })
-
-checkBinding :: (Name, ()) -> Code (Name, Arr Meta)
-checkBinding (name, ()) = do
-  arr <- liftA2 Arr metaNewEmpty metaNewEmpty
-  pure (name, arr)
-
---  IDEA: Memoize to avoid allocating a lot of new vars.
-checkTerm ::
-  Checking Scope ->
-  Parsed Term ->
-  Code (WithArr (Checking Term))
-checkTerm scope0 = \case
-  TermName () name -> do
-    arr <- checkName scope0 name
-    flush
-    pure (arr :!: TermName arr name)
-  TermVar () name -> do
-    arr <- checkName scope0 name
-    flush
-    pure (arr :!: TermVar arr name)
-  TermValue value -> do
-    arr <- do
-      obj <- metaNewOf ObjObj
-      input <- metaNewEmpty
-      output <- metaNewOf (ObjsCons obj input)
-      pure Arr { input, output }
-    pure (arr :!: TermValue value)
-  TermGroup () body0 -> do
-    arr :!: body1 <- checkExpression scope0 body0
-    flush
-    pure (arr :!: TermGroup arr body1)
-  TermBlock () block0 -> do
-    arr0 :!: block1 <- checkBlock scope0 block0
-    flush
-    arr1 <- do
-      obj <- Meta <$> varOf (Just (ObjArr arr0))
-      input <- Meta <$> varOf Nothing
-      output <- Meta <$> varOf (Just (ObjsCons obj input))
-      pure Arr { input, output }
-    pure (arr1 :!: TermBlock arr1 block1)
-
-checkExpression ::
-  Checking Scope ->
-  Parsed Expression ->
-  Code (WithArr (Checking Expression))
-checkExpression scope0 expression = do
-  terms1 <- for expression.terms (checkTerm scope0)
-  flush
-  identityArr <- do
-    objs <- Meta <$> varOf Nothing
-    pure (Arr objs objs)
-  arr <- (`State.execStateT` identityArr) do
-    for_ terms1 \(producerArr :!: _producer) -> do
-      consumerArr <- State.get
-      composedArr <- lift do
-        checkCompose consumerArr producerArr
-      State.put composedArr
-  flush
-  pure (arr :!: Expression (fmap snd terms1))
-
-checkCompose :: Arr Meta -> Arr Meta -> Code (Arr Meta)
-checkCompose consumer producer = do
-  input0 <- varGet consumer.input.var
-  output0 <- varGet producer.output.var
-  for_ ((liftA2 (,) `on` toLazy) input0 output0)
-    (Lazy.uncurry checkObjs)
-  flush
-  pure
-    Arr {
-      input = producer.input,
-      output = consumer.output
-    }
-
-checkObjs :: Objs Meta -> Objs Meta -> Code ()
-checkObjs ObjsNil ObjsNil = pure ()
-checkObjs (ObjsCons x xs) (ObjsCons y ys) = do
-  checkMaybe checkObj x y
-  flush
-  checkMaybe checkObjs xs ys
-  flush
-checkObjs _ _ =
-  throwError (toException (Error "mismatched objects"))
-
-checkMaybe ::
-  (a -> a -> Code ()) ->
-  Meta a ->
-  Meta a ->
-  Code ()
-checkMaybe check x y = do
-  x1 <- varGet x.var
-  y1 <- varGet y.var
-  case (x1, y1) of
-    (Just x2, Just y2) -> do
-      check x2 y2
-      flush
-    (Nothing, y2@Just{}) -> do
-      varPutResult x.var (Right y2)
-      flush
-    (x2@Just{}, Nothing) -> do
-      varPutResult y.var (Right x2)
-      flush
-    (Nothing, Nothing) ->
-      pure ()
-
-checkObj :: Obj Meta -> Obj Meta -> Code ()
-checkObj ObjObj ObjObj = pure ()
-checkObj (ObjArr leftArr) (ObjArr rightArr) = do
-  checkArr leftArr rightArr
-  flush
---  IDEA: Unify 'Obj' with 'Arr' from unit?
-checkObj _ _ =
-  throwError (toException (Error "object and arrow"))
-
-checkArr :: Arr Meta -> Arr Meta -> Code ()
-checkArr
-  (Arr leftInput leftOutput)
-  (Arr rightInput rightOutput) = do
-  checkMaybe checkObjs leftInput rightInput
-  flush
-  checkMaybe checkObjs leftOutput rightOutput
-  flush
-
-checkName :: Checking Scope -> Name -> Code (Arr Meta)
-checkName scope name = case Map.lookup name scope of
-  Lazy.Just arr -> pure arr
-  Lazy.Nothing ->
-    throwError (toException (Error "missing name"))
-
-----------------------------------------------------------------
 --  Compilation
 ----------------------------------------------------------------
 
-type CompileScope = Map Name (Var Value)
+type Compile :: Type -> Type
+type Compile = ReaderT CompileScope Code
 
-programCompile :: ProgramChecked -> ProgramCompiled
-programCompile = compileBlock (mempty :: CompileScope)
+type CompileScope :: Type
+type CompileScope = Scope (Var Value)
 
-compileBlock :: CompileScope -> Checked Block -> Code Value
-compileBlock scope0 block = do
-  scope1 <- fmap Map do
+programCompile :: ProgramParsed -> Code ProgramCompiled
+programCompile program = do
+  scope <- Reader.asks (.scope)
+  scope0 <- readIORef scope
+  scope1 :!: code <- compile scope0 do
+    compileBlock program
+  writeIORef scope (scopeExtendWith scope1 scope0)
+  pure code
+
+compile :: CompileScope -> Compile a -> Code a
+compile = flip runReaderT
+
+compileBlock ::
+  Parsed Block ->
+  Compile (CompileScope :!: Code ())
+compileBlock block = do
+  scope <- fmap Map do
     for (Map.toList block.scope) compileBinding
-  let
-    -- IDEA: Allow shadowing to be a warning.
-    scope2 = Map.unionWithKey
-      (\key _old _new ->
-        Prelude.error ("shadowed variable: " <> show key))
-      scope0
-      scope1
-  compileExpression scope2 block.body
+  body <- Reader.local (scopeExtendWith scope) do
+    for block.body compileStatement
+  pure (scope :!: sequenceA_ body)
+
+--  IDEA: Allow shadowing to be a warning.
+scopeExtendWith :: CompileScope -> CompileScope -> CompileScope
+scopeExtendWith scope scope0 =
+  Map.unionWithKey
+    (\key _old _new ->
+      Prelude.error ("shadowed variable: " <> show key))
+    scope0
+    scope
 
 compileBinding ::
-  (Name, Arr Identity) ->
-  Code (Name, Var Value)
-compileBinding (name, _type) = do
-  var <- varNew do
-    throwError (toException (Error "uninitialized"))
+  (Name, annotation) ->
+  Compile (Name, Var Value)
+compileBinding (name, _annotation) = do
+  var <- lift do varNewLazy throwUninitialized
   pure (name, var)
 
-compileTerm :: CompileScope -> Checked Term -> Code Value
-compileTerm scope0 = \case
-  TermName _object name -> compileName scope0 name
-  TermVar _object name -> compileName scope0 name
-  TermValue value -> pure value
-  TermGroup _object body -> compileExpression scope0 body
-  TermBlock _object block -> compileBlock scope0 block
+compileTerm ::
+  Parsed Term ->
+  Compile (Code ())
+compileTerm = \case
+  TermName _object name ->
+    compileName name
+  TermVar _object name ->
+    compileName name
+  TermValue value -> do
+    var <- lift do varOf value
+    pure do
+      stackPush var
+  TermGroup _object body ->
+    compileExpression body
+  TermBlock _object block -> fmap snd do
+    compileBlock block
 
 compileExpression ::
-  CompileScope ->
-  Checked Expression ->
-  Code Value
-compileExpression scope0 expression = do
-  loop [] (Foldable.toList expression.terms)
-  where
-    loop stack (term : terms) = undefined
-    loop stack [] = undefined
+  Parsed Expression ->
+  Compile (Code ())
+compileExpression expression = do
+  terms <- for expression.terms compileTerm
+  pure do
+    sequenceA_ (Seq.reverse terms)
+
+compileStatement ::
+  Parsed Expression ->
+  Compile (Code ())
+compileStatement = compileExpression
 
 compileName ::
-  CompileScope ->
   Name ->
-  Code Value
-compileName scope name = case Map.lookup name scope of
-  Lazy.Just var -> varGet var
+  Compile (Code ())
+compileName name = Reader.asks (Map.lookup name) >>= \case
+  Lazy.Just var -> pure do
+    stackPush var
   Lazy.Nothing ->
     throwError (toException (Error "missing name"))
 
