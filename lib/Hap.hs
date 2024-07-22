@@ -810,6 +810,11 @@ codeTry world code = fmap (toStrict . join) do
           Timeout.timeout (micro timeout_s) do
             codeRun world code
 
+codeTest :: (Debug a) => Code a -> IO a
+codeTest code = do
+  world <- worldNew
+  codeRun world code
+
 codeRun :: (Debug a) => World -> Code a -> IO a
 codeRun world code0 = do
   resultVar <- varNewUninitialized world
