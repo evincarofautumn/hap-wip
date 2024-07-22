@@ -36,6 +36,7 @@ import Prelude hiding
     (.),
     error,
     exp,
+    exponent,
     fst,
     head,
     id,
@@ -110,6 +111,7 @@ import Data.Kind (Constraint, Type)
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Ratio qualified as Ratio
 import Data.Semigroup (Last(Last, getLast))
 import Data.Sequence (Seq((:<|), (:|>)))
 import Data.Sequence qualified as Seq
@@ -117,7 +119,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Strict.Classes (toLazy, toStrict)
 import Data.Strict.Either (Either(Left, Right))
-import Data.Strict.Maybe (Maybe(Nothing, Just), maybe)
+import Data.Strict.Maybe (Maybe(Nothing, Just), catMaybes, maybe)
 import Data.Strict.Tuple (type (:!:), pattern (:!:), fst, snd, uncurry)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -220,7 +222,7 @@ compileOne ::
   ProgramLoaded ->
   Code ProgramCompiled
 compileOne loaded = do
-  tokenized <- (varNewStrict . pure . programTokenize) loaded
+  tokenized <- (varNewStrict . pure . programTokenize . programLex) loaded
   parsed <- (varNewStrict . (programParse <=< varGet)) tokenized
   compiled <- (programCompile <=< varGet) parsed
   pure compiled
@@ -229,7 +231,7 @@ compileAll ::
   Seq ProgramLoaded ->
   Code (Seq ProgramCompiled)
 compileAll loaded = do
-  tokenized <- traverse (varNewStrict . pure . programTokenize) loaded
+  tokenized <- traverse (varNewStrict . pure . programTokenize . programLex) loaded
   parsed <- traverse (varNewStrict . (programParse <=< varGet)) tokenized
   compiled <- traverse (programCompile <=< varGet) parsed
   pure compiled
@@ -1153,8 +1155,23 @@ each = Foldable.toList
 pattern CharLineFeed :: Char
 pattern CharLineFeed = '\x000A'
 
+pattern CharExclamationMark :: Char
+pattern CharExclamationMark = '\x0021'
+
 pattern CharQuotationMark :: Char
 pattern CharQuotationMark = '\x0022'
+
+pattern CharNumberSign :: Char
+pattern CharNumberSign = '\x0023'
+
+pattern CharPercentSign :: Char
+pattern CharPercentSign = '\x0025'
+
+pattern CharAmpersand :: Char
+pattern CharAmpersand = '\x0026'
+
+pattern CharApostrophe :: Char
+pattern CharApostrophe = '\x0027'
 
 pattern CharLeftParenthesis :: Char
 pattern CharLeftParenthesis = '\x0028'
@@ -1162,11 +1179,23 @@ pattern CharLeftParenthesis = '\x0028'
 pattern CharRightParenthesis :: Char
 pattern CharRightParenthesis = '\x0029'
 
+pattern CharAsterisk :: Char
+pattern CharAsterisk = '\x002A'
+
+pattern CharPlusSign :: Char
+pattern CharPlusSign = '\x002B'
+
 pattern CharComma :: Char
 pattern CharComma = '\x002C'
 
+pattern CharHyphenMinus :: Char
+pattern CharHyphenMinus = '\x002D'
+
 pattern CharFullStop :: Char
 pattern CharFullStop = '\x002E'
+
+pattern CharSolidus :: Char
+pattern CharSolidus = '\x002F'
 
 pattern CharColon :: Char
 pattern CharColon = '\x003A'
@@ -1174,11 +1203,41 @@ pattern CharColon = '\x003A'
 pattern CharSemicolon :: Char
 pattern CharSemicolon = '\x003B'
 
+pattern CharLessThanSign :: Char
+pattern CharLessThanSign = '\x003C'
+
+pattern CharEqualsSign :: Char
+pattern CharEqualsSign = '\x003D'
+
+pattern CharGreaterThanSign :: Char
+pattern CharGreaterThanSign = '\x003E'
+
+pattern CharQuestionMark :: Char
+pattern CharQuestionMark = '\x003F'
+
+pattern CharCommercialAt :: Char
+pattern CharCommercialAt = '\x0040'
+
+pattern CharReverseSolidus :: Char
+pattern CharReverseSolidus = '\x005C'
+
+pattern CharCircumflexAccent :: Char
+pattern CharCircumflexAccent = '\x005E'
+
+pattern CharLowLine :: Char
+pattern CharLowLine = '\x005F'
+
 pattern CharLeftCurlyBracket :: Char
 pattern CharLeftCurlyBracket = '\x007B'
 
+pattern CharVerticalLine :: Char
+pattern CharVerticalLine = '\x007C'
+
 pattern CharRightCurlyBracket :: Char
 pattern CharRightCurlyBracket = '\x007D'
+
+pattern CharTilde :: Char
+pattern CharTilde = '\x007E'
 
 charIsTextEnd :: Char -> Bool
 charIsTextEnd = \case
@@ -1186,19 +1245,46 @@ charIsTextEnd = \case
   CharQuotationMark -> True
   _ -> False
 
-charIsTokenBoundary :: Char -> Bool
-charIsTokenBoundary = \case
-  CharQuotationMark -> True
-  CharLeftParenthesis -> True
-  CharRightParenthesis -> True
-  CharComma -> True
-  CharColon -> True
-  CharSemicolon -> True
-  CharLeftCurlyBracket -> True
-  CharRightCurlyBracket -> True
+charIsWord :: Char -> Bool
+charIsWord = \case
+  --  CharApostrophe -> True
+  --  CharHyphenMinus -> True
+  --  CharLowLine -> True
   char
-    | Char.isSpace char -> True
+    | Char.isLetter char -> True
   _ -> False
+
+charIsJoiner :: Char -> Bool
+charIsJoiner = \case
+  CharLowLine -> True
+  _ -> False
+
+charIsSymbol :: Char -> Bool
+charIsSymbol = \case
+  CharExclamationMark -> True
+  CharNumberSign -> True
+  CharPercentSign -> True
+  CharAmpersand -> True
+  CharAsterisk -> True
+  CharPlusSign -> True
+  CharHyphenMinus -> True
+  CharFullStop -> True
+  CharSolidus -> True
+  CharLessThanSign -> True
+  CharEqualsSign -> True
+  CharGreaterThanSign -> True
+  CharQuestionMark -> True
+  CharCommercialAt -> True
+  --  CharLowLine -> True
+  CharReverseSolidus -> True
+  _ -> False
+
+--  Reserved:
+--
+--  * U+0024 dollar sign
+--  * U+005E circumflex accent
+--  * U+0060 grave accent
+--  * U+007E tilde
 
 ----------------------------------------------------------------
 --  Lexical Syntax
@@ -1337,14 +1423,24 @@ prettyText =
 ----------------------------------------------------------------
 
 type ProgramLoaded = Text
+type ProgramLexed = Lexels
 type ProgramTokenized = Tokens
 type ProgramParsed = Parsed Block
 type ProgramCompiled = Code ()
 
+type Lexels = [Lexel]
+
+type Lexel = Maybe Token
+
 type Tokens = [Token]
 
 data Token
-  = TokenWord !Text
+  = TokenName !Text
+  | TokenSymbol !Text
+  | TokenJoiner !Text
+  | TokenIntegral !(Maybe Sign) !Text
+  | TokenFractional !(Maybe Sign) !Text !Text
+  | TokenScientific !(Maybe Sign) !Text !Text !(Maybe Sign) !Text
   | TokenKeyword !Text
   | TokenText !Text
   | TokenGroupBegin
@@ -1357,8 +1453,27 @@ data Token
 
 instance Debug Token where
   debug = \case
-    TokenWord word ->
-      pretty word
+    TokenName name ->
+      pretty name
+    TokenIntegral signs natural ->
+      foldMap debug signs <> pretty natural
+    TokenFractional signs whole fraction ->
+      hcat [
+        foldMap debug signs,
+        pretty whole,
+        pretty CharFullStop,
+        pretty fraction
+      ]
+    TokenScientific signs whole fraction exponentSigns exponent ->
+      hcat [
+        foldMap debug signs,
+        pretty whole,
+        pretty CharFullStop,
+        pretty fraction,
+        "e",
+        foldMap debug exponentSigns,
+        pretty exponent
+      ]
     TokenKeyword keyword ->
       hcat [pretty CharColon, pretty keyword]
     TokenText text ->
@@ -1379,6 +1494,29 @@ instance Debug Token where
       pretty CharComma
     TokenStatementSeparator ->
       pretty CharSemicolon
+
+data Sign
+  = SignNeg
+  | SignPos
+  deriving stock (Generic, Show)
+
+instance Debug Sign where
+  debug SignNeg = "-"
+  debug SignPos = "+"
+
+--  data Base
+--    = BaseDecimal
+--    deriving stock (Generic, Show)
+
+--  data Figure =
+--    Figure {
+--      sign :: !Sign,
+--      base :: !Base,
+--      significand :: !Integer,
+--      shift :: !(Maybe Nat),
+--      exponent :: !(Maybe Int)
+--    }
+--    deriving stock (Generic, Show)
 
 newtype Expression annotation where
   Expression :: { terms :: Terms a } -> Expression a
@@ -1480,14 +1618,23 @@ instance
 
 data Value
   = ValueNone
-  | ValueNumber !Number
+  | ValueNatural !Natural
+  | ValueInteger !Integer
+  | ValueRational !Rational
   | ValueText !Text
   deriving stock (Generic, Show)
 
 instance Debug Value where
   debug = \case
     ValueNone -> "none"
-    ValueNumber number -> pretty number
+    ValueNatural natural -> pretty natural
+    ValueInteger integer -> pretty integer
+    ValueRational rational ->
+      hcat [
+        pretty (Ratio.numerator rational),
+        "/",
+        pretty (Ratio.denominator rational)
+      ]
     ValueText text ->
       hcat [
         pretty CharQuotationMark,
@@ -1550,20 +1697,201 @@ programLoad = \case
 --  Tokenization
 ----------------------------------------------------------------
 
-programTokenize :: ProgramLoaded -> ProgramTokenized
-programTokenize = \case
+programTokenize :: ProgramLexed -> ProgramTokenized
+programTokenize =
+  catMaybes .
+  tokenizeSigns .
+  tokenizeScientifics .
+  tokenizeDecimals .
+  tokenizeSeparators .
+  (Nothing :) .
+  (<> [Nothing])
+
+tokenizeSeparators :: Lexels -> Lexels
+
+--  Digits separated by a joiner are joined as digits.
+tokenizeSeparators
+  (
+    Just (TokenIntegral Nothing digits1) :
+    Just (TokenJoiner _joiner) :
+    Just (TokenIntegral Nothing digits2) :
+    lexels1
+  )
+  = tokenizeSeparators
+  (
+    Just (TokenIntegral Nothing (digits1 <> digits2)) :
+    lexels1
+  )
+
+--  Names followed by digits are joined as a name.
+tokenizeSeparators
+  (
+    Just (TokenName name) :
+    Just (TokenIntegral Nothing digits) :
+    lexels1
+  )
+  = tokenizeSeparators
+  (
+    Just (TokenName (name <> digits)) :
+    lexels1
+  )
+
+--  Names followed by joiners are joined as a name.
+tokenizeSeparators
+  (
+    Just (TokenName name) :
+    Just (TokenJoiner joiner) :
+    lexels1
+  )
+  = tokenizeSeparators
+  (
+    Just (TokenName (name <> joiner)) :
+    lexels1
+  )
+
+tokenizeSeparators (lexel : lexels1) =
+  lexel : tokenizeSeparators lexels1
+
+tokenizeSeparators [] = []
+
+tokenizeDecimals :: Lexels -> Lexels
+
+--  Digits separated by a decimal point
+--  are joined into a fractional number.
+tokenizeDecimals
+  (
+    Just (TokenIntegral Nothing whole) :
+    Just (TokenSymbol ".") :
+    Just (TokenIntegral Nothing fraction) :
+    lexels1
+  )
+  =
+  (
+    Just (TokenFractional Nothing whole fraction) :
+    tokenizeDecimals lexels1
+  )
+
+--  Digits preceded by a decimal point
+--  are joined into a fractional number.
+tokenizeDecimals
+  (
+    Just (TokenSymbol ".") :
+    Just (TokenIntegral Nothing fraction) :
+    lexels1
+  ) =
+    Just (TokenFractional Nothing "" fraction) :
+    tokenizeDecimals lexels1
+
+--  Digits followed by a decimal point
+--  are joined into a fractional number.
+tokenizeDecimals
+  (
+    Just (TokenIntegral Nothing whole) :
+    Just (TokenSymbol ".") :
+    lexels1
+  ) =
+    Just (TokenFractional Nothing whole "") :
+    tokenizeDecimals lexels1
+
+tokenizeDecimals (lexel : lexels1) =
+  lexel : tokenizeDecimals lexels1
+
+tokenizeDecimals [] = []
+
+tokenizeScientifics :: Lexels -> Lexels
+
+--  An integral or fractional number
+--  and an exponent with an optional sign
+--  are joined into a scientific number.
+tokenizeScientifics
+  (Just token : Just (TokenName "e") : lexels1)
+  | Just (whole :!: fraction) <- case token of
+      TokenIntegral Nothing whole ->
+        Just (whole :!: "")
+      TokenFractional Nothing whole fraction ->
+        Just (whole :!: fraction)
+      _ -> Nothing,
+    Just ((exponentSigns :!: exponent) :!: lexels2) <-
+      case lexels1 of
+        Just (TokenIntegral Nothing exponent) :
+          lexels2 ->
+          Just ((Nothing :!: exponent) :!: lexels2)
+        Just (TokenSymbol "+") :
+          Just (TokenIntegral Nothing exponent) :
+          lexels2 ->
+          Just ((Just SignPos :!: exponent) :!: lexels2)
+        Just (TokenSymbol "-") :
+          Just (TokenIntegral Nothing exponent) :
+          lexels2 ->
+          Just ((Just SignNeg :!: exponent) :!: lexels2)
+        _ -> Nothing
+
+  =
+    Just
+      (TokenScientific
+        Nothing
+        whole
+        fraction
+        exponentSigns
+        exponent) :
+    tokenizeScientifics lexels2
+
+tokenizeScientifics (lexel : lexels1)
+  = lexel : tokenizeScientifics lexels1
+
+tokenizeScientifics [] = []
+
+tokenizeSigns :: Lexels -> Lexels
+
+--  A sign and a number are joined into a signed number.
+tokenizeSigns (Just token1 : Just token2 : lexels1)
+  | signs@Just{} <- case token1 of
+      TokenSymbol "-" -> Just SignNeg
+      TokenSymbol "+" -> Just SignPos
+      _ -> Nothing,
+    lexels@Just{} <- case token2 of
+      TokenIntegral Nothing whole ->
+        Just (TokenIntegral signs whole)
+      TokenFractional Nothing whole fraction ->
+        Just (TokenFractional signs whole fraction)
+      TokenScientific
+        Nothing
+        whole
+        fraction
+        exponentSigns
+        exponent ->
+        Just
+          (TokenScientific
+            signs
+            whole
+            fraction
+            exponentSigns
+            exponent)
+      _ -> Nothing
+  =
+    lexels : tokenizeSigns lexels1
+
+tokenizeSigns (lexel : lexels1) = lexel : tokenizeSigns lexels1
+
+tokenizeSigns [] = []
+
+programLex :: ProgramLoaded -> ProgramLexed
+programLex = \case
   TextEmpty -> []
   TextCons char chars1
     | CharQuotationMark <- char -> let
       (text, chars2) = Text.break charIsTextEnd chars1
-      in TokenText text : programTokenize (Text.drop 1 chars2)
-    | CharColon <- char -> case tokenizeWord chars1 of
+      in Just (TokenText text) : programLex (Text.drop 1 chars2)
+    | CharColon <- char -> case lexSymbol chars1 of
       Just (keyword :!: chars2) ->
-        TokenKeyword keyword : programTokenize chars2
-      Nothing ->
-        TokenKeyword "" : programTokenize chars1
+        Just (TokenKeyword keyword) : programLex chars2
+      Nothing -> case lexWord chars1 of
+        Just (keyword :!: chars2) ->
+          Just (TokenKeyword keyword) : programLex chars2
+        Nothing ->
+          Just (TokenKeyword "") : programLex chars1
     | Just token <- matchPunctuation char ->
-      token : programTokenize chars1
+      Just token : programLex chars1
     where
       matchPunctuation = \case
         CharLeftParenthesis -> Just TokenGroupBegin
@@ -1574,15 +1902,38 @@ programTokenize = \case
         CharRightCurlyBracket -> Just TokenBlockEnd
         _ -> Nothing
   chars0
-    | Just (word :!: chars1) <- tokenizeWord chars0 ->
-      TokenWord word : programTokenize chars1
+    | Just (number :!: chars1) <- lexNumber chars0 ->
+      Just (TokenIntegral Nothing number) : programLex chars1
+    | Just (joiner :!: chars1) <- lexJoiner chars0 ->
+      Just (TokenJoiner joiner) : programLex chars1
+    | Just (symbol :!: chars1) <- lexSymbol chars0 ->
+      Just (TokenName symbol) : programLex chars1
+    | Just (name :!: chars1) <- lexWord chars0 ->
+      Just (TokenName name) : programLex chars1
+    | Just (_ :!: chars1) <- lexSome Char.isSpace chars0 ->
+      Nothing : programLex chars1
     | otherwise ->
-      programTokenize (Text.stripStart chars0)
+      Prelude.error
+        ("unhandled input: " <> show (Text.unpack chars0))
 
-tokenizeWord :: Text -> Maybe (Text :!: Text)
-tokenizeWord chars0 = let
-  (word, chars1) = Text.break charIsTokenBoundary chars0
-  in if Text.null word then Nothing else Just (word :!: chars1)
+lexNumber :: Text -> Maybe (Text :!: Text)
+lexNumber = lexSome Char.isDigit
+
+lexWord :: Text -> Maybe (Text :!: Text)
+lexWord = lexSome charIsWord
+
+lexJoiner :: Text -> Maybe (Text :!: Text)
+lexJoiner = lexSome charIsJoiner
+
+lexSymbol :: Text -> Maybe (Text :!: Text)
+lexSymbol = lexSome charIsSymbol
+
+lexSome :: (Char -> Bool) -> Text -> Maybe (Text :!: Text)
+lexSome predicate chars0 = let
+  (result, chars1) = Text.span predicate chars0
+  in if Text.null result
+    then Nothing
+    else Just (result :!: chars1)
 
 ----------------------------------------------------------------
 --  Parsing
@@ -1659,25 +2010,44 @@ parseOneTerm = \case
   [] -> throwError (toException (Error "missing term"))
   token : tokens1 -> case token of
     TokenKeyword KeywordVar
-      | TokenWord word : tokens2 <- tokens1 -> let
-        name = Name word
+      | TokenName name : tokens2 <- tokens1 -> let
         in pure
           (
-            TermVar () name,
-            (Union . Map) [(name, Seq [()])],
+            TermVar () (Name name),
+            (Union . Map) [(Name name, Seq [()])],
             tokens2
           )
       | otherwise ->
         throwError (toException (Error "missing name"))
     TokenKeyword keyword ->
       throwError (toException (Error "unknown keyword"))
-    TokenWord word ->
+    TokenName name ->
       pure (term, mempty, tokens1)
       where
-        term = maybe
-          (TermName () (Name word))
-          (TermValue . ValueNumber)
-          (parseNumber word)
+        term = TermName () (Name name)
+    TokenIntegral signs digits -> case Text.Read.decimal digits of
+      Lazy.Right (magnitude, TextEmpty) ->
+        pure (term, mempty, tokens1)
+        where
+          term = TermValue number
+          number = case signs of
+            Just SignNeg ->
+              ValueInteger (negate (fromIntegral magnitude))
+            Just SignPos ->
+              ValueInteger (fromIntegral magnitude)
+            Nothing ->
+              ValueNatural magnitude
+      _ ->
+        throwError (toException (Error "unknown number"))
+    TokenFractional signs wholeDigits fractionDigits ->
+      undefined
+    TokenScientific
+      signs
+      wholeDigits
+      fractionDigits
+      exponentSigns
+      exponentDigits ->
+      undefined
     TokenText text ->
       pure (TermValue (ValueText text), mempty, tokens1)
     TokenGroupBegin -> case tokens2 of
