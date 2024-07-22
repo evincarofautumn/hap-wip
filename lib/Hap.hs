@@ -1168,6 +1168,9 @@ pattern CharComma = '\x002C'
 pattern CharFullStop :: Char
 pattern CharFullStop = '\x002E'
 
+pattern CharColon :: Char
+pattern CharColon = '\x003A'
+
 pattern CharSemicolon :: Char
 pattern CharSemicolon = '\x003B'
 
@@ -1189,6 +1192,7 @@ charIsTokenBoundary = \case
   CharLeftParenthesis -> True
   CharRightParenthesis -> True
   CharComma -> True
+  CharColon -> True
   CharSemicolon -> True
   CharLeftCurlyBracket -> True
   CharRightCurlyBracket -> True
@@ -1356,7 +1360,7 @@ instance Debug Token where
     TokenWord word ->
       pretty word
     TokenKeyword keyword ->
-      hcat [pretty CharFullStop, pretty keyword]
+      hcat [pretty CharColon, pretty keyword]
     TokenText text ->
       hcat [
         pretty CharQuotationMark,
@@ -1422,7 +1426,7 @@ instance (Debug a) => Debug (Term a) where
       debug name
     TermVar _ann name ->
       sep [
-        hcat [pretty CharFullStop, pretty KeywordVar],
+        hcat [pretty CharColon, pretty KeywordVar],
         debug name
       ]
     TermValue value ->
@@ -1548,10 +1552,16 @@ programLoad = \case
 
 programTokenize :: ProgramLoaded -> ProgramTokenized
 programTokenize = \case
+  TextEmpty -> []
   TextCons char chars1
     | CharQuotationMark <- char -> let
       (text, chars2) = Text.break charIsTextEnd chars1
       in TokenText text : programTokenize (Text.drop 1 chars2)
+    | CharColon <- char -> case tokenizeWord chars1 of
+      Just (keyword :!: chars2) ->
+        TokenKeyword keyword : programTokenize chars2
+      Nothing ->
+        TokenKeyword "" : programTokenize chars1
     | Just token <- matchPunctuation char ->
       token : programTokenize chars1
     where
@@ -1564,20 +1574,15 @@ programTokenize = \case
         CharRightCurlyBracket -> Just TokenBlockEnd
         _ -> Nothing
   chars0
-    | TextEmpty <- word,
-      TextEmpty <- chars1 ->
-      []
-    | TextEmpty <- word ->
-      programTokenize (Text.stripStart chars1)
+    | Just (word :!: chars1) <- tokenizeWord chars0 ->
+      TokenWord word : programTokenize chars1
     | otherwise ->
-      token : programTokenize chars1
-    where
-      (word, chars1) = Text.break charIsTokenBoundary chars0
-      token
-        | TextCons CharFullStop keyword <- word =
-          TokenKeyword keyword
-        | otherwise =
-          TokenWord word
+      programTokenize (Text.stripStart chars0)
+
+tokenizeWord :: Text -> Maybe (Text :!: Text)
+tokenizeWord chars0 = let
+  (word, chars1) = Text.break charIsTokenBoundary chars0
+  in if Text.null word then Nothing else Just (word :!: chars1)
 
 ----------------------------------------------------------------
 --  Parsing
