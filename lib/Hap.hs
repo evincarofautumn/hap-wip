@@ -97,7 +97,7 @@ import Data.DList (DList)
 import Data.DList qualified as DList
 import Data.Either qualified as Lazy (partitionEithers)
 import Data.Foldable (fold, for_, sequenceA_, toList, traverse_)
-import Data.Foldable qualified as Foldable (toList)
+import Data.Foldable qualified as Foldable
 import Data.Function ((&), on)
 import Data.Functor.Compose (Compose(Compose, getCompose))
 import Data.Functor.Identity (Identity(Identity, runIdentity))
@@ -715,13 +715,13 @@ instance (Debug a) => Debug (Identity a) where
   debug = debug . runIdentity
 
 instance (Debug a) => Debug (Maybe a) where
-  debug = debug . Foldable.toList
+  debug = debug . each
 
 instance (Debug a) => Debug [a] where
   debug = pretty . fmap (prettyText . debug)
 
 instance (Debug a) => Debug (Seq a) where
-  debug = debug . Foldable.toList
+  debug = debug . each
 
 instance (Debug k, Debug v) => Debug (Map k v) where
   debug = debug . Map.toList
@@ -1132,10 +1132,14 @@ parseCommand input0 = case Text.strip input0 of
   _ -> Nothing
 
 ----------------------------------------------------------------
---  Prelude Renaming
+--  Renaming
 ----------------------------------------------------------------
 
 type Nat = Prelude.Word
+
+{-# Inline each #-}
+each :: (Foldable t) => t a -> [a]
+each = Foldable.toList
 
 ----------------------------------------------------------------
 --  Character Set
@@ -1219,7 +1223,7 @@ pattern Map assocs <- (Map.toList -> assocs)
 {-# Complete Seq #-}
 
 pattern Seq :: [a] -> Seq a
-pattern Seq list <- (Foldable.toList -> list)
+pattern Seq list <- (each -> list)
   where
     Seq list = Seq.fromList list
 
@@ -1386,7 +1390,7 @@ instance (Debug a) => Debug (Expression a) where
   debug exp =
     hcat [
       pretty CharLeftParenthesis,
-      sep (fmap debug (Foldable.toList exp.terms)),
+      sep (fmap debug (each exp.terms)),
       pretty CharRightParenthesis
     ]
 
@@ -1509,7 +1513,7 @@ instance (Debug a) => Debug (Block a) where
       "{",
       sep [
         hcat [debug statement, ";"]
-        | statement <- Foldable.toList block.body
+        | statement <- each block.body
       ],
       "}"
     ]
