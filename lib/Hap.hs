@@ -1171,10 +1171,13 @@ consoleLoop = do
         world <- Reader.asks (.world)
         results <- codeTry world do
           join (compileOne line)
-        consoleOutput case results of
-          Right result -> Text (show result)
+        consoleOutput =<< case results of
+          Right () ->
+            fmap
+              (prettyText . debug)
+              (stackSnap =<< readIORef world.stack)
           Left error ->
-            Text (displayException error)
+            (pure . Text . displayException) error
         consoleLoop
 
 consoleInput :: String -> Consoled (Lazy.Maybe Text)
