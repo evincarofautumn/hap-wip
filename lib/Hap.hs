@@ -30,10 +30,11 @@ module Hap (module Hap) where
 
 import Prelude hiding
   (
-    Either(..),
-    Maybe(..),
+    Either (..),
+    Maybe (..),
     Word,
     (.),
+    cycle,
     error,
     exp,
     exponent,
@@ -44,6 +45,7 @@ import Prelude hiding
     last,
     lines,
     maybe,
+    significand,
     snd,
     tail,
     uncurry,
@@ -51,8 +53,8 @@ import Prelude hiding
 import Prelude qualified
 import Prelude qualified as Lazy
   (
-    Either(..),
-    Maybe(..),
+    Either (..),
+    Maybe (..),
     fst,
     maybe,
     snd,
@@ -71,24 +73,50 @@ import Control.Concurrent.STM.TBQueue (TBQueue, flushTBQueue)
 import Control.Concurrent.STM.TBQueue qualified as TBQueue
 import Control.Concurrent.STM.TChan (TChan, writeTChan)
 import Control.Concurrent.STM.TChan qualified as TChan
-import Control.Concurrent.STM.TQueue (TQueue, writeTQueue, flushTQueue)
+import Control.Concurrent.STM.TQueue
+  (
+    TQueue,
+    writeTQueue,
+    flushTQueue
+  )
 import Control.Concurrent.STM.TQueue qualified as TQueue
-import Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVar, readTVar, stateTVar, writeTVar)
+import Control.Concurrent.STM.TVar
+  (
+    TVar,
+    modifyTVar',
+    newTVar,
+    readTVar,
+    stateTVar,
+    writeTVar
+  )
 import Control.Concurrent.STM.TVar qualified as TVar
-import Control.Exception (Exception(displayException, fromException, toException), SomeAsyncException(..), SomeException(..), finally, throwIO, try)
+import Control.Exception
+  (
+    Exception (displayException, fromException, toException),
+    SomeAsyncException (..),
+    SomeException (..),
+    finally,
+    try,
+  )
 import Control.Exception qualified as Exception
 import Control.Monad ((<=<), (>=>), join, void, when)
-import Control.Monad.Except (MonadError, ExceptT, throwError, tryError)
+import Control.Monad.Except
+  (
+    MonadError,
+    ExceptT,
+    throwError,
+    tryError,
+  )
 import Control.Monad.Except qualified as Error
 import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.Reader (MonadReader, ReaderT(runReaderT))
+import Control.Monad.Reader (MonadReader, ReaderT (runReaderT))
 import Control.Monad.Reader qualified as Reader
 import Control.Monad.STM (STM, orElse)
 import Control.Monad.STM qualified as STM
 import Control.Monad.State.Strict (MonadState, StateT)
 import Control.Monad.State.Strict qualified as State
-import Control.Monad.Trans.Class (MonadTrans(lift))
-import Control.Monad.Trans.Maybe (MaybeT(MaybeT, runMaybeT))
+import Control.Monad.Trans.Class (MonadTrans (lift))
+import Control.Monad.Trans.Maybe (MaybeT (MaybeT, runMaybeT))
 import Control.Monad.Writer (MonadWriter, WriterT)
 import Control.Monad.Writer qualified as Writer
 import Data.ByteString qualified as ByteString
@@ -100,8 +128,8 @@ import Data.Either qualified as Lazy (partitionEithers)
 import Data.Foldable (fold, for_, sequenceA_, toList, traverse_)
 import Data.Foldable qualified as Foldable
 import Data.Function ((&), on)
-import Data.Functor.Compose (Compose(Compose, getCompose))
-import Data.Functor.Identity (Identity(Identity, runIdentity))
+import Data.Functor.Compose (Compose (Compose, getCompose))
+import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.IORef (IORef)
 import Data.IORef qualified as IORef
 import Data.IntMap.Strict (IntMap)
@@ -118,9 +146,21 @@ import Data.Sequence qualified as Seq
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Strict.Classes (toLazy, toStrict)
-import Data.Strict.Either (Either(Left, Right))
-import Data.Strict.Maybe (Maybe(Nothing, Just), catMaybes, maybe)
-import Data.Strict.Tuple (type (:!:), pattern (:!:), fst, snd, uncurry)
+import Data.Strict.Either (Either (Left, Right))
+import Data.Strict.Maybe
+  (
+    Maybe (Nothing, Just),
+    catMaybes,
+    maybe
+  )
+import Data.Strict.Tuple
+  (
+    type (:!:),
+    pattern (:!:),
+    fst,
+    snd,
+    uncurry
+  )
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -135,14 +175,24 @@ import GHC.Exts qualified
 import GHC.Natural (Natural)
 import Optics ((%~))
 import Optics qualified
-import Prettyprinter (Pretty(pretty), hcat, hsep, hang, sep, vcat, vsep)
+import Prettyprinter
+  (
+    Pretty (pretty),
+    (<+>),
+    hang,
+    hcat,
+    hsep,
+    sep,
+    vcat,
+    vsep,
+  )
 import Prettyprinter qualified as Pretty
 import Prettyprinter.Render.Text qualified
 import SDL (($=))
 import SDL qualified
 import System.Console.Haskeline qualified as Haskeline
 import System.Console.Haskeline.IO qualified as Haskeline.IO
-import System.Exit (ExitCode(..), exitWith)
+import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPrint, hPutStrLn, stderr)
 import System.Mem.Weak (Weak)
 import System.Mem.Weak qualified as Weak
@@ -478,23 +528,26 @@ instance Applicative Code where
                 (pure . AnsGet . Get forX . UseBind)
                   \x -> varGet varF <*> useRun useX x
 
-throwUninitialized ::
+throw ::
   (MonadError SomeException m) =>
+  Doc ->
   m bottom
-throwUninitialized =
-  throwError (toException (Error "uninitialized"))
+throw = Error.throwError . toException . Error
 
-throwUnsolved ::
+uninitialized ::
   (MonadError SomeException m) =>
   m bottom
-throwUnsolved =
-  throwError (toException (Error "unsolved"))
+uninitialized = throw "uninitialized"
 
-throwCycle ::
+unsolved ::
   (MonadError SomeException m) =>
   m bottom
-throwCycle =
-  throwError (toException (Error "cycle"))
+unsolved = throw "unsolved"
+
+cycle ::
+  (MonadError SomeException m) =>
+  m bottom
+cycle = throw "cycle"
 
 useRun :: Use a b -> a -> Code b
 useRun = \case
@@ -553,7 +606,7 @@ stackPop :: Code (Var Value)
 stackPop = do
   stack <- Reader.asks (.stack)
   readIORef stack >>= \case
-    [] -> throwError (toException (Error "underflow"))
+    [] -> throw "underflow"
     top : down -> do
       writeIORef stack down
       pure top
@@ -701,6 +754,15 @@ class Debug a where
 dbg :: (Debug a) => a -> Pretty.Doc ann
 dbg = vacuous . debug
 
+limit :: Int -> [Doc] -> [Doc]
+limit n xs = case splitAt n xs of
+  ([], []) -> []
+  (before, []) -> before
+  (before, _after) -> before <> ["..."]
+
+commas :: [Doc] -> [Doc]
+commas = Pretty.punctuate ","
+
 instance Debug Int where
   debug = pretty
 
@@ -711,7 +773,12 @@ instance Debug () where
   debug = pretty
 
 instance (Debug a, Debug b) => Debug (a, b) where
-  debug (a, b) = sep [hcat [debug a, ","], debug b]
+  debug (a, b) =
+    (sep . commas) [debug a, debug b]
+
+instance (Debug a, Debug b, Debug c) => Debug (a, b, c) where
+  debug (a, b, c) =
+    (sep . commas) [debug a, debug b, debug c]
 
 instance (Debug a) => Debug (Identity a) where
   debug = debug . runIdentity
@@ -720,7 +787,7 @@ instance (Debug a) => Debug (Maybe a) where
   debug = debug . each
 
 instance (Debug a) => Debug [a] where
-  debug = pretty . fmap (prettyText . debug)
+  debug = sep . commas . fmap debug
 
 instance (Debug a) => Debug (Seq a) where
   debug = debug . each
@@ -815,7 +882,9 @@ codeTry world code = fmap (toStrict . join) do
 codeTest :: (Debug a) => Code a -> IO a
 codeTest code = do
   world <- worldNew
-  codeRun world code
+  result <- codeRun world code
+  (liftIO . print . debug) result
+  pure result
 
 codeRun :: (Debug a) => World -> Code a -> IO a
 codeRun world code0 = do
@@ -828,12 +897,12 @@ codeRun world code0 = do
         StoreFull (Right result) -> do
           pure result
         StoreFull (Left error) -> do
-          throw error
-        StoreEmpty -> throw (Error "result empty (not begun)")
-        StoreFilling -> throw (Error "result empty (not done)")
+          throwIO error
+        StoreEmpty -> throwIO (Error "result empty (not begun)")
+        StoreFilling -> throwIO (Error "result empty (not done)")
     Left error -> do
-      throw error
-    Right _queue -> throw (Error "ended with work left")
+      throwIO error
+    Right _queue -> throwIO (Error "ended with work left")
 
   where
 
@@ -844,7 +913,7 @@ codeRun world code0 = do
         Lazy.Left error
           | Lazy.Just SomeAsyncException{} <-
               fromException error ->
-            throw error
+            throwIO error
           | otherwise -> do
             pure (Left error)
         Lazy.Right (AnsNow result) -> do
@@ -905,7 +974,7 @@ varGet var = (join . atomically) do
               writeTVar var.store (StoreFull (Right value))
             pure value
     StoreFilling -> pure do
-      throwCycle
+      cycle
 
 varPutResult ::
   Var a ->
@@ -963,7 +1032,7 @@ varNewLazy = varNew StratLazy
 
 varNewUninitialized :: (Debug a) => World -> IO (Var a)
 varNewUninitialized world =
-  varNewFrom world StratLazy throwUninitialized
+  varNewFrom world StratLazy uninitialized
 
 varNewFrom ::
   (Debug a) =>
@@ -1347,6 +1416,7 @@ pattern TextEmpty <- (Text.null -> True)
 ----------------------------------------------------------------
 
 newtype Union a = Union { union :: a }
+  deriving newtype (Debug)
 
 instance
   (
@@ -1401,8 +1471,8 @@ readIORef = liftIO . IORef.readIORef
 readTVarIO :: (MonadIO m) => TVar a -> m a
 readTVarIO = liftIO . TVar.readTVarIO
 
-throw :: (Exception e, MonadIO m) => e -> m z
-throw = liftIO . throwIO
+throwIO :: (Exception e, MonadIO m) => e -> m z
+throwIO = liftIO . Exception.throwIO
 
 writeIORef :: (MonadIO m) => IORef a -> a -> m ()
 writeIORef = fmap liftIO . IORef.writeIORef
@@ -1455,6 +1525,10 @@ instance Debug Token where
   debug = \case
     TokenName name ->
       pretty name
+    TokenSymbol symbol ->
+      pretty symbol
+    TokenJoiner joiner ->
+      pretty joiner
     TokenIntegral signs natural ->
       foldMap debug signs <> pretty natural
     TokenFractional signs whole fraction ->
@@ -1700,59 +1774,47 @@ programLoad = \case
 programTokenize :: ProgramLexed -> ProgramTokenized
 programTokenize =
   catMaybes .
+  tokenizeSuffixes .
   tokenizeSigns .
   tokenizeScientifics .
   tokenizeDecimals .
-  tokenizeSeparators .
+  tokenizeJoiners .
   (Nothing :) .
   (<> [Nothing])
 
-tokenizeSeparators :: Lexels -> Lexels
+tokenizeJoiners :: Lexels -> Lexels
 
 --  Digits separated by a joiner are joined as digits.
-tokenizeSeparators
+tokenizeJoiners
   (
     Just (TokenIntegral Nothing digits1) :
     Just (TokenJoiner _joiner) :
     Just (TokenIntegral Nothing digits2) :
     lexels1
   )
-  = tokenizeSeparators
+  = tokenizeJoiners
   (
     Just (TokenIntegral Nothing (digits1 <> digits2)) :
     lexels1
   )
 
---  Names followed by digits are joined as a name.
-tokenizeSeparators
-  (
-    Just (TokenName name) :
-    Just (TokenIntegral Nothing digits) :
-    lexels1
-  )
-  = tokenizeSeparators
-  (
-    Just (TokenName (name <> digits)) :
-    lexels1
-  )
-
 --  Names followed by joiners are joined as a name.
-tokenizeSeparators
+tokenizeJoiners
   (
     Just (TokenName name) :
     Just (TokenJoiner joiner) :
     lexels1
   )
-  = tokenizeSeparators
+  = tokenizeJoiners
   (
     Just (TokenName (name <> joiner)) :
     lexels1
   )
 
-tokenizeSeparators (lexel : lexels1) =
-  lexel : tokenizeSeparators lexels1
+tokenizeJoiners (lexel : lexels1) =
+  lexel : tokenizeJoiners lexels1
 
-tokenizeSeparators [] = []
+tokenizeJoiners [] = []
 
 tokenizeDecimals :: Lexels -> Lexels
 
@@ -1805,11 +1867,11 @@ tokenizeScientifics :: Lexels -> Lexels
 --  are joined into a scientific number.
 tokenizeScientifics
   (Just token : Just (TokenName "e") : lexels1)
-  | Just (whole :!: fraction) <- case token of
-      TokenIntegral Nothing whole ->
-        Just (whole :!: "")
-      TokenFractional Nothing whole fraction ->
-        Just (whole :!: fraction)
+  | Just (signs :!: (whole :!: fraction)) <- case token of
+      TokenIntegral signs whole ->
+        Just (signs :!: (whole :!: ""))
+      TokenFractional signs whole fraction ->
+        Just (signs :!: (whole :!: fraction))
       _ -> Nothing,
     Just ((exponentSigns :!: exponent) :!: lexels2) <-
       case lexels1 of
@@ -1829,15 +1891,15 @@ tokenizeScientifics
   =
     Just
       (TokenScientific
-        Nothing
+        signs
         whole
         fraction
         exponentSigns
         exponent) :
     tokenizeScientifics lexels2
 
-tokenizeScientifics (lexel : lexels1)
-  = lexel : tokenizeScientifics lexels1
+tokenizeScientifics (lexel : lexels1) =
+  lexel : tokenizeScientifics lexels1
 
 tokenizeScientifics [] = []
 
@@ -1871,9 +1933,31 @@ tokenizeSigns (Just token1 : Just token2 : lexels1)
   =
     lexels : tokenizeSigns lexels1
 
-tokenizeSigns (lexel : lexels1) = lexel : tokenizeSigns lexels1
+tokenizeSigns (lexel : lexels1) =
+  lexel : tokenizeSigns lexels1
 
 tokenizeSigns [] = []
+
+tokenizeSuffixes :: Lexels -> Lexels
+
+--  Names followed by digits are joined as a name
+--  as long as they were not part of a number, like @e3@.
+tokenizeSuffixes
+  (
+    Just (TokenName name) :
+    Just (TokenIntegral Nothing digits) :
+    lexels1
+  )
+  = tokenizeSuffixes
+  (
+    Just (TokenName (name <> digits)) :
+    lexels1
+  )
+
+tokenizeSuffixes (lexel : lexels1) =
+  lexel : tokenizeSuffixes lexels1
+
+tokenizeSuffixes [] = []
 
 programLex :: ProgramLoaded -> ProgramLexed
 programLex = \case
@@ -1907,7 +1991,7 @@ programLex = \case
     | Just (joiner :!: chars1) <- lexJoiner chars0 ->
       Just (TokenJoiner joiner) : programLex chars1
     | Just (symbol :!: chars1) <- lexSymbol chars0 ->
-      Just (TokenName symbol) : programLex chars1
+      Just (TokenSymbol symbol) : programLex chars1
     | Just (name :!: chars1) <- lexWord chars0 ->
       Just (TokenName name) : programLex chars1
     | Just (_ :!: chars1) <- lexSome Char.isSpace chars0 ->
@@ -1958,7 +2042,13 @@ parseAllStatements tokens0
   | null tokens1 =
     pure Block { scope, body = Seq statements }
   | otherwise =
-    throwError (toException (Error "missing end of input"))
+    (throw . vsep) [
+      "unknown statement:",
+      (hang 4 . vsep . limit 8) [
+        hsep ["*", debug token]
+        | token <- tokens1
+      ]
+    ]
   where
     (statements, sites, tokens1) = parseManyStatements tokens0
     scope = scopeFromSites sites
@@ -2007,8 +2097,16 @@ parseOneTerm ::
   Tokens ->
   m (ParseResult (Parsed Term))
 parseOneTerm = \case
-  [] -> throwError (toException (Error "missing term"))
+  [] -> throw "missing term"
   token : tokens1 -> case token of
+    TokenName name ->
+      pure (term, mempty, tokens1)
+      where
+        term = TermName () (Name name)
+    TokenSymbol symbol ->
+      throw ("unknown symbol:" <+> debug symbol)
+    TokenJoiner joiner ->
+      throw ("unknown joiner:" <+> debug joiner)
     TokenKeyword KeywordVar
       | TokenName name : tokens2 <- tokens1 -> let
         in pure
@@ -2018,36 +2116,63 @@ parseOneTerm = \case
             tokens2
           )
       | otherwise ->
-        throwError (toException (Error "missing name"))
+        throw "missing name"
     TokenKeyword keyword ->
-      throwError (toException (Error "unknown keyword"))
-    TokenName name ->
+      throw ("unknown keyword:" <+> debug keyword)
+    TokenIntegral signs digits -> do
+      magnitude <- parseDecimal digits
+      let
+        value = case signs of
+          Just SignNeg ->
+            ValueInteger (negate (fromIntegral magnitude))
+          Just SignPos ->
+            ValueInteger (fromIntegral magnitude)
+          Nothing ->
+            ValueNatural magnitude
+        term = TermValue value
       pure (term, mempty, tokens1)
-      where
-        term = TermName () (Name name)
-    TokenIntegral signs digits -> case Text.Read.decimal digits of
-      Lazy.Right (magnitude, TextEmpty) ->
-        pure (term, mempty, tokens1)
-        where
-          term = TermValue number
-          number = case signs of
-            Just SignNeg ->
-              ValueInteger (negate (fromIntegral magnitude))
-            Just SignPos ->
-              ValueInteger (fromIntegral magnitude)
-            Nothing ->
-              ValueNatural magnitude
-      _ ->
-        throwError (toException (Error "unknown number"))
-    TokenFractional signs wholeDigits fractionDigits ->
-      undefined
+    TokenFractional signs wholeDigits fractionDigits -> do
+      whole <- parseDecimal0 wholeDigits
+      fraction <- parseDecimal0 fractionDigits
+      let
+        shift = Text.length fractionDigits
+        magnitude =
+          (whole Ratio.% 1)
+            + (fraction Ratio.% 10 ^ shift)
+        value = case signs of
+          Just SignNeg ->
+            ValueRational (negate magnitude)
+          Just SignPos ->
+            ValueRational magnitude
+          Nothing ->
+            ValueRational magnitude
+        term = TermValue value
+      pure (term, mempty, tokens1)
     TokenScientific
       signs
       wholeDigits
       fractionDigits
       exponentSigns
-      exponentDigits ->
-      undefined
+      exponentDigits -> do
+      whole <- parseDecimal0 wholeDigits
+      fraction <- parseDecimal0 fractionDigits
+      exponent <- parseDecimal0 @Int exponentDigits
+      let
+        shift = Text.length fractionDigits
+        significand =
+          (whole Ratio.% 1)
+            + fraction Ratio.% 10 ^ shift
+        scale = 10 ^ exponent
+        magnitude = case exponentSigns of
+          Just SignNeg -> significand / scale
+          Just SignPos -> significand * scale
+          Nothing -> significand * scale
+        value = ValueRational case signs of
+          Just SignNeg -> negate magnitude
+          Just SignPos -> magnitude
+          Nothing -> magnitude
+        term = TermValue value
+      pure (term, mempty, tokens1)
     TokenText text ->
       pure (TermValue (ValueText text), mempty, tokens1)
     TokenGroupBegin -> case tokens2 of
@@ -2059,11 +2184,11 @@ parseOneTerm = \case
             tokens3
           )
       _ ->
-        throwError (toException (Error "missing group end"))
+        throw "missing group end"
       where
         (terms, sites, tokens2) = parseManyTerms tokens1
     TokenGroupEnd ->
-      throwError (toException (Error "unmatched group end"))
+      throw "unmatched group end"
     TokenBlockBegin -> case tokens2 of
       TokenBlockEnd : tokens3 ->
         pure (block, mempty, tokens3)
@@ -2071,25 +2196,35 @@ parseOneTerm = \case
           block = TermBlock ()
             (Block scope (Seq statements))
       _ ->
-        throwError (toException (Error "missing block end"))
+        throw "missing block end"
       where
         ~(statements, sites, tokens2) =
           parseManyStatements tokens1
         scope = scopeFromSites sites
     TokenBlockEnd ->
-      throwError (toException (Error "unmatched block end"))
+      throw "unmatched block end"
     TokenExpressionSeparator ->
-      throwError (toException (Error "misplaced expression separator"))
+      throw "misplaced expression separator"
     TokenStatementSeparator ->
-      throwError (toException (Error "misplaced statement separator"))
+      throw "misplaced statement separator"
 
-parseNumber :: Text -> Maybe Number
-parseNumber word
-  | Lazy.Right (number, TextEmpty) <-
-      Text.Read.signed Text.Read.decimal word =
-    Just number
-  | otherwise =
-    Nothing
+parseDecimal0 ::
+  (Integral i, MonadError SomeException m) =>
+  Text ->
+  m i
+parseDecimal0 TextEmpty = pure 0
+parseDecimal0 digits = parseDecimal digits
+
+parseDecimal ::
+  (Integral i, MonadError SomeException m) =>
+  Text ->
+  m i
+parseDecimal digits =
+  case Text.Read.decimal digits of
+    Lazy.Right (value, TextEmpty) ->
+      pure value
+    _ ->
+      throw ("unknown number:" <+> pretty digits)
 
 ----------------------------------------------------------------
 --  Compilation
@@ -2136,7 +2271,7 @@ compileBinding ::
   (Name, annotation) ->
   Compile (Name, Var Value)
 compileBinding (name, _annotation) = do
-  var <- lift do varNewLazy throwUninitialized
+  var <- lift do varNewLazy uninitialized
   pure (name, var)
 
 compileTerm ::
@@ -2176,6 +2311,6 @@ compileName name = Reader.asks (Map.lookup name) >>= \case
   Lazy.Just var -> pure do
     stackPush var
   Lazy.Nothing ->
-    throwError (toException (Error "missing name"))
+    throw ("missing name:" <+> debug name)
 
 ----------------------------------------------------------------
