@@ -139,6 +139,9 @@ import Data.Kind (Constraint, Type)
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe qualified as Lazy (fromMaybe)
+import Data.Monoid (Ap (Ap, getAp))
+import Data.Monoid qualified as Monoid
 import Data.Ratio qualified as Ratio
 import Data.Semigroup (Last(Last, getLast))
 import Data.Sequence (Seq((:<|), (:|>)))
@@ -1216,6 +1219,19 @@ type Nat = Prelude.Word
 {-# Inline each #-}
 each :: (Foldable t) => t a -> [a]
 each = Foldable.toList
+
+----------------------------------------------------------------
+--  Extensions
+----------------------------------------------------------------
+
+sequence0 ::
+  (Applicative f, Foldable t) =>
+  t (f a) ->
+  f (Lazy.Maybe a)
+sequence0 =
+  fmap Monoid.getLast .
+  getAp .
+  foldMap (Ap . fmap (Monoid.Last . Lazy.Just))
 
 ----------------------------------------------------------------
 --  Character Set
