@@ -47,6 +47,7 @@ import Prelude hiding
     maybe,
     significand,
     snd,
+    sum,
     tail,
     uncurry,
   )
@@ -119,6 +120,8 @@ import Control.Monad.Trans.Class (MonadTrans (lift))
 import Control.Monad.Trans.Maybe (MaybeT (MaybeT, runMaybeT))
 import Control.Monad.Writer (MonadWriter, WriterT)
 import Control.Monad.Writer qualified as Writer
+import Data.Array (Array)
+import Data.Array qualified as Array
 import Data.ByteString qualified as ByteString
 import Data.Char qualified as Char
 import Data.Coerce (coerce)
@@ -135,9 +138,10 @@ import Data.IORef qualified as IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
 import Data.IntSet (IntSet)
+import Data.Ix (Ix)
 import Data.Kind (Constraint, Type)
 import Data.List (partition)
-import Data.Map.Strict (Map)
+import Data.Map.Strict (Map, (!?))
 import Data.Map.Strict qualified as Map
 import Data.Maybe qualified as Lazy (fromMaybe)
 import Data.Monoid (Ap (Ap, getAp))
@@ -170,6 +174,7 @@ import Data.Text.Encoding qualified as Text.Encoding
 import Data.Text.IO qualified as Text.IO
 import Data.Text.Read qualified as Text.Read
 import Data.Traversable (for)
+import Data.Tuple qualified as Tuple
 import Data.Void (Void, absurd, vacuous)
 import Data.Word (Word8)
 import GHC.Generics (Generic)
@@ -558,7 +563,7 @@ useRun = \case
   UseBind needA -> \a -> needA a
 
 putRun :: Put -> Code ()
-putRun (Put code var) = varPutResult var . Right =<< code
+putRun (Put code var) = varPut var =<< code
 
 instance Monad Code where
   codeX >>= codeF = Code \world -> do
@@ -600,10 +605,12 @@ data World
   }
   deriving stock (Generic)
 
-stackPush :: Var Value -> Code ()
-stackPush value = do
+stackPeek :: Code (Var Value)
+stackPeek = do
   stack <- Reader.asks (.stack)
-  modifyIORef' stack (value :)
+  readIORef stack >>= \case
+    [] -> throw "underflow"
+    top : _down -> pure top
 
 stackPop :: Code (Var Value)
 stackPop = do
@@ -613,6 +620,11 @@ stackPop = do
     top : down -> do
       writeIORef stack down
       pure top
+
+stackPush :: Var Value -> Code ()
+stackPush value = do
+  stack <- Reader.asks (.stack)
+  modifyIORef' stack (value :)
 
 worldSnap :: (MonadIO m) => World -> m WorldSnap
 worldSnap world = do
@@ -952,9 +964,10 @@ flush = do
     flushTQueue queue
   for_ actions putRun
 
-varGet ::
-  Var a ->
-  Code a
+varForce :: Var a -> Code ()
+varForce = void . varGet
+
+varGet :: Var a -> Code a
 varGet var = (join . atomically) do
   store <- readTVar var.store
   case store of
@@ -978,6 +991,9 @@ varGet var = (join . atomically) do
             pure value
     StoreFilling -> pure do
       cycle
+
+varPut :: Var a -> a -> Code ()
+varPut var = varPutResult var . Right
 
 varPutResult ::
   Var a ->
@@ -1335,15 +1351,14 @@ charIsTextEnd = \case
 
 charIsWord :: Char -> Bool
 charIsWord = \case
-  --  CharApostrophe -> True
-  --  CharHyphenMinus -> True
-  --  CharLowLine -> True
   char
     | Char.isLetter char -> True
   _ -> False
 
 charIsJoiner :: Char -> Bool
 charIsJoiner = \case
+  CharApostrophe -> True
+  CharHyphenMinus -> True
   CharLowLine -> True
   _ -> False
 
@@ -1528,7 +1543,8 @@ data Token
   | TokenSymbol !Text
   | TokenJoiner !Text
   | TokenIntegral !(Maybe Sign) !Text
-  | TokenFractional !(Maybe Sign) !Text !Text
+  | TokenDecimal !(Maybe Sign) !Text !Text
+  | TokenRational !(Maybe Sign) !Text !Text
   | TokenScientific !(Maybe Sign) !Text !Text !(Maybe Sign) !Text
   | TokenKeyword !Text
   | TokenText !Text
@@ -1550,12 +1566,19 @@ instance Debug Token where
       pretty joiner
     TokenIntegral signs natural ->
       foldMap debug signs <> pretty natural
-    TokenFractional signs whole fraction ->
+    TokenDecimal signs whole fraction ->
       hcat [
         foldMap debug signs,
         pretty whole,
         pretty CharFullStop,
         pretty fraction
+      ]
+    TokenRational signs numerator denominator ->
+      hcat [
+        foldMap debug signs,
+        pretty numerator,
+        pretty CharSolidus,
+        pretty denominator
       ]
     TokenScientific signs whole fraction exponentSigns exponent ->
       hcat [
@@ -1795,6 +1818,7 @@ programTokenize =
   catMaybes .
   tokenizeSuffixes .
   tokenizeSigns .
+  tokenizeFractions .
   tokenizeScientifics .
   tokenizeDecimals .
   tokenizeJoiners .
@@ -1807,7 +1831,7 @@ tokenizeJoiners :: Lexels -> Lexels
 tokenizeJoiners
   (
     Just (TokenIntegral Nothing digits1) :
-    Just (TokenJoiner _joiner) :
+    Just (TokenJoiner "_") :
     Just (TokenIntegral Nothing digits2) :
     lexels1
   )
@@ -1817,16 +1841,30 @@ tokenizeJoiners
     lexels1
   )
 
---  Names followed by joiners are joined as a name.
+--  A name and a joiner are joined as a name.
 tokenizeJoiners
   (
     Just (TokenName name) :
     Just (TokenJoiner joiner) :
     lexels1
   )
+  | joiner `elem` ["-", "'"]
   = tokenizeJoiners
   (
     Just (TokenName (name <> joiner)) :
+    lexels1
+  )
+
+--  A name and a name are joined as a name.
+tokenizeJoiners
+  (
+    Just (TokenName name1) :
+    Just (TokenName name2) :
+    lexels1
+  )
+  = tokenizeJoiners
+  (
+    Just (TokenName (name1 <> name2)) :
     lexels1
   )
 
@@ -1848,7 +1886,7 @@ tokenizeDecimals
   )
   =
   (
-    Just (TokenFractional Nothing whole fraction) :
+    Just (TokenDecimal Nothing whole fraction) :
     tokenizeDecimals lexels1
   )
 
@@ -1860,7 +1898,7 @@ tokenizeDecimals
     Just (TokenIntegral Nothing fraction) :
     lexels1
   ) =
-    Just (TokenFractional Nothing "" fraction) :
+    Just (TokenDecimal Nothing "" fraction) :
     tokenizeDecimals lexels1
 
 --  Digits followed by a decimal point
@@ -1871,7 +1909,7 @@ tokenizeDecimals
     Just (TokenSymbol ".") :
     lexels1
   ) =
-    Just (TokenFractional Nothing whole "") :
+    Just (TokenDecimal Nothing whole "") :
     tokenizeDecimals lexels1
 
 tokenizeDecimals (lexel : lexels1) =
@@ -1889,7 +1927,7 @@ tokenizeScientifics
   | Just (signs :!: (whole :!: fraction)) <- case token of
       TokenIntegral signs whole ->
         Just (signs :!: (whole :!: ""))
-      TokenFractional signs whole fraction ->
+      TokenDecimal signs whole fraction ->
         Just (signs :!: (whole :!: fraction))
       _ -> Nothing,
     Just ((exponentSigns :!: exponent) :!: lexels2) <-
@@ -1901,7 +1939,7 @@ tokenizeScientifics
           Just (TokenIntegral Nothing exponent) :
           lexels2 ->
           Just ((Just SignPos :!: exponent) :!: lexels2)
-        Just (TokenSymbol "-") :
+        Just (TokenJoiner "-") :
           Just (TokenIntegral Nothing exponent) :
           lexels2 ->
           Just ((Just SignNeg :!: exponent) :!: lexels2)
@@ -1922,19 +1960,41 @@ tokenizeScientifics (lexel : lexels1) =
 
 tokenizeScientifics [] = []
 
+--  Whole numbers separated by a slash
+--  are joined into a fraction.
+tokenizeFractions :: Lexels -> Lexels
+
+tokenizeFractions
+  (
+    Just (TokenIntegral Nothing whole1) :
+    Just (TokenSymbol "/") :
+    Just (TokenIntegral Nothing whole2) :
+    lexels1
+  )
+  =
+  Just (TokenRational Nothing whole1 whole2) :
+  tokenizeFractions lexels1
+
+tokenizeFractions (lexel : lexels1) =
+  lexel : tokenizeFractions lexels1
+
+tokenizeFractions [] = []
+
 tokenizeSigns :: Lexels -> Lexels
 
 --  A sign and a number are joined into a signed number.
 tokenizeSigns (Just token1 : Just token2 : lexels1)
   | signs@Just{} <- case token1 of
-      TokenSymbol "-" -> Just SignNeg
+      TokenJoiner "-" -> Just SignNeg
       TokenSymbol "+" -> Just SignPos
       _ -> Nothing,
     lexels@Just{} <- case token2 of
       TokenIntegral Nothing whole ->
         Just (TokenIntegral signs whole)
-      TokenFractional Nothing whole fraction ->
-        Just (TokenFractional signs whole fraction)
+      TokenDecimal Nothing whole fraction ->
+        Just (TokenDecimal signs whole fraction)
+      TokenRational Nothing numerator denominator ->
+        Just (TokenRational signs numerator denominator)
       TokenScientific
         Nothing
         whole
@@ -2150,7 +2210,7 @@ parseOneTerm = \case
             ValueNatural magnitude
         term = TermValue value
       pure (term, mempty, tokens1)
-    TokenFractional signs wholeDigits fractionDigits -> do
+    TokenDecimal signs wholeDigits fractionDigits -> do
       whole <- parseDecimal0 wholeDigits
       fraction <- parseDecimal0 fractionDigits
       let
@@ -2158,6 +2218,22 @@ parseOneTerm = \case
         magnitude =
           (whole Ratio.% 1)
             + (fraction Ratio.% 10 ^ shift)
+        value = case signs of
+          Just SignNeg ->
+            ValueRational (negate magnitude)
+          Just SignPos ->
+            ValueRational magnitude
+          Nothing ->
+            ValueRational magnitude
+        term = TermValue value
+      pure (term, mempty, tokens1)
+    TokenRational signs numeratorDigits denominatorDigits -> do
+      numerator <- parseDecimal numeratorDigits
+      denominator <- parseDecimal denominatorDigits
+      when (denominator == 0) do
+        (throw . sep) ["undefined rational", debug token]
+      let
+        magnitude = numerator Ratio.% denominator
         value = case signs of
           Just SignNeg ->
             ValueRational (negate magnitude)
@@ -2326,10 +2402,172 @@ compileStatement = compileExpression
 compileName ::
   Name ->
   Compile (Code ())
-compileName name = Reader.asks (Map.lookup name) >>= \case
+compileName name = Reader.asks (!? name) >>= \case
   Lazy.Just var -> pure do
     stackPush var
-  Lazy.Nothing ->
-    throw ("missing name:" <+> debug name)
+  Lazy.Nothing -> case builtinIds !? name of
+    Lazy.Just builtin ->
+      compileBuiltin builtin
+    Lazy.Nothing ->
+      throw ("missing name:" <+> debug name)
+
+compileBuiltin ::
+  Builtin ->
+  Compile (Code ())
+compileBuiltin = \case
+
+  BuiltinVarGet -> pure do
+    var <- stackPeek
+    varForce var
+
+  BuiltinVarPutIn -> pure do
+    var <- stackPop
+    val <- stackPop
+    varPut var =<< varGet val
+
+  BuiltinVarPostTo -> throw "TODO: post-to"
+
+  BuiltinNumAdd ->
+    compileBuiltinBinary StratStrict builtinNumAdd
+  BuiltinNumSubFrom -> do
+    compileBuiltinBinary StratStrict builtinNumSubFrom
+  BuiltinNumMul -> do
+    compileBuiltinBinary StratStrict builtinNumMul
+  BuiltinNumDiv -> do
+    compileBuiltinBinary StratStrict builtinNumDiv
+  BuiltinNumModOf -> do
+    compileBuiltinBinary StratStrict builtinNumModOf
+
+compileBuiltinBinary ::
+  Strat ->
+  (Value -> Value -> Code Value) ->
+  Compile (Code ())
+compileBuiltinBinary strat builtin = do
+  output <- lift do
+    varNew strat uninitialized
+  pure do
+    input1 <- stackPop
+    input2 <- stackPop
+    stackPush output
+    varPutLazy output do
+      join do
+        liftA2 builtin (varGet input1) (varGet input2)
+    case strat of
+      StratStrict -> varForce output
+      StratLazy -> pure ()
 
 ----------------------------------------------------------------
+--  Builtins
+----------------------------------------------------------------
+
+data Builtin
+
+  = BuiltinVarGet
+  | BuiltinVarPutIn
+  | BuiltinVarPostTo
+
+  | BuiltinNumAdd
+  | BuiltinNumSubFrom
+  | BuiltinNumMul
+  | BuiltinNumDiv
+  | BuiltinNumModOf
+
+  deriving stock (Bounded, Enum, Eq, Generic, Ix, Ord, Show)
+
+builtins :: Array Builtin Name
+builtins = Array.array (minBound, maxBound)
+  [
+    (BuiltinVarGet,      Name "get"     ),
+    (BuiltinVarPutIn,    Name "put-in"  ),
+    (BuiltinVarPostTo,   Name "post-to" ),
+    (BuiltinNumAdd,      Name "add"     ),
+    (BuiltinNumSubFrom,  Name "sub-from"),
+    (BuiltinNumMul,      Name "mul"     ),
+    (BuiltinNumDiv,      Name "div"     ),
+    (BuiltinNumModOf,    Name "mod-of"  )
+  ]
+
+builtinIds :: Scope Builtin
+builtinIds = (Map . fmap Tuple.swap . Array.assocs) builtins
+
+builtinName :: Builtin -> Name
+builtinName = (builtins Array.!)
+
+builtinNumAdd :: Value -> Value -> Code Value
+builtinNumAdd =
+  builtinNumBinary (builtinName BuiltinNumAdd) (+)
+
+builtinNumSubFrom :: Value -> Value -> Code Value
+builtinNumSubFrom =
+  builtinNumBinary (builtinName BuiltinNumSubFrom) (-)
+
+builtinNumMul :: Value -> Value -> Code Value
+builtinNumMul =
+  builtinNumBinary (builtinName BuiltinNumMul) (*)
+
+builtinNumDiv :: Value -> Value -> Code Value
+builtinNumDiv =
+  builtinFractionalBinary (builtinName BuiltinNumDiv) (/)
+
+builtinNumModOf :: Value -> Value -> Code Value
+builtinNumModOf =
+  builtinIntegralBinary (builtinName BuiltinNumModOf) mod
+
+builtinIntegralBinary ::
+  Name ->
+  (forall a. (Integral a) => a -> a -> a) ->
+  Value -> Value -> Code Value
+builtinIntegralBinary name f = curry \case
+  (ValueNatural n1, ValueNatural n2) ->
+    pure (ValueNatural (f n1 n2))
+  (ValueInteger i1, ValueInteger i2) ->
+    pure (ValueInteger (f i1 i2))
+  (value1, value2) ->
+    (throw . sep) [
+      "can't apply",
+      debug name,
+      "to",
+      debug value1,
+      "and",
+      debug value2
+    ]
+
+builtinFractionalBinary ::
+  Name ->
+  (forall a. (Fractional a) => a -> a -> a) ->
+  Value -> Value -> Code Value
+builtinFractionalBinary name f = curry \case
+  (r1@ValueRational{}, ValueRational 0) ->
+    (throw . sep) ["can't divide", debug r1, "by zero"]
+  (ValueRational r1, ValueRational r2) ->
+    pure (ValueRational (f r1 r2))
+  (value1, value2) ->
+    (throw . sep) [
+      "can't apply",
+      debug name,
+      "to",
+      debug value1,
+      "and",
+      debug value2
+    ]
+
+builtinNumBinary ::
+  Name ->
+  (forall a. (Num a) => a -> a -> a) ->
+  Value -> Value -> Code Value
+builtinNumBinary name f = curry \case
+  (ValueNatural n1, ValueNatural n2) ->
+    pure (ValueNatural (f n1 n2))
+  (ValueInteger i1, ValueInteger i2) ->
+    pure (ValueInteger (f i1 i2))
+  (ValueRational r1, ValueRational r2) ->
+    pure (ValueRational (f r1 r2))
+  (value1, value2) ->
+    (throw . sep) [
+      "can't apply",
+      debug name,
+      "to",
+      debug value1,
+      "and",
+      debug value2
+    ]
