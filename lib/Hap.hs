@@ -62,6 +62,7 @@ import Prelude qualified as Lazy
     uncurry,
   )
 
+import Control.Applicative (liftA3)
 import Control.Arrow (Arrow)
 import Control.Arrow qualified as Arrow
 import Control.Category (Category, (.), (>>>))
@@ -246,7 +247,6 @@ defaultSettings =
 
 startIO :: Settings -> IO ()
 startIO settings = do
-  messages <- messagesNew
   world <- worldNew
   compiledPrograms <- codeRun world do
     loaded <- traverse programLoad settings.sources
@@ -260,16 +260,16 @@ startIO settings = do
         InputBatch ->
           pure ExitSuccess
         InputInteractive ->
-          consoleRun messages world
-      messagesRequest messages (RequestExit exitCode)
+          consoleRun world
+      messagesRequest world.messages (RequestExit exitCode)
 
     startOutput =
       case settings.output of
         OutputGraphics ->
-          graphicsRun messages
+          graphicsRun world.messages
         OutputText ->
           messagesLoop
-            messages
+            world.messages
             (pure ())
             (\_request -> pure ())
 
@@ -298,18 +298,17 @@ compileAll loaded = do
 --  Output Thread
 ----------------------------------------------------------------
 
-data Messages =
+newtype Messages =
   Messages {
-    requests :: !(TBQueue Request)
+    requests :: TBQueue Request
   }
   deriving stock (Generic)
 
 data Request
   = RequestOutput !Text
-  | RequestGraphicsClear
-  | RequestGraphicsBackgroundSet
-    !(Word8) !(Word8) !(Word8) !(Word8)
-  | RequestGraphicsPresent
+  | RequestDrawClear
+  | RequestDrawColor !(Word8) !(Word8) !(Word8) !(Word8)
+  | RequestDrawShow
   | RequestExit !ExitCode
   deriving stock (Generic, Show)
 
@@ -393,13 +392,13 @@ graphicsRequest ::
 graphicsRequest graphics = \case
   RequestOutput text -> lift do
     Text.IO.putStrLn text
-  RequestGraphicsClear -> lift do
+  RequestDrawClear -> lift do
     SDL.clear graphics.renderer
-  RequestGraphicsBackgroundSet r g b a -> lift do
+  RequestDrawColor r g b a -> lift do
     SDL.rendererDrawColor graphics.renderer $=
       SDL.V4 r g b a
     SDL.clear graphics.renderer
-  RequestGraphicsPresent -> lift do
+  RequestDrawShow -> lift do
     SDL.present graphics.renderer
   RequestExit exitCode ->
     throwError exitCode
@@ -601,7 +600,8 @@ data World
     heap :: !(TVar Heap),
     scope :: !(IORef CompileScope),
     stack :: !(IORef [Var Value]),
-    queue :: !(TQueue Put)
+    queue :: !(TQueue Put),
+    messages :: !Messages
   }
   deriving stock (Generic)
 
@@ -952,7 +952,8 @@ worldNew = do
   scope <- IORef.newIORef (mempty :: CompileScope)
   stack <- IORef.newIORef []
   queue <- newTQueueIO
-  pure World { next, heap, scope, stack, queue }
+  messages <- messagesNew
+  pure World { next, heap, scope, stack, queue, messages }
 
 heapNew :: IO (TVar Heap)
 heapNew = newTVarIO idMapEmpty
@@ -1144,22 +1145,26 @@ idNew source = atomically do
       where
         !id1 = succ id0
 
+send :: Request -> Code ()
+send request = do
+  messages <- Reader.asks (.messages)
+  messagesRequest messages request
+
 ----------------------------------------------------------------
 --  Console
 ----------------------------------------------------------------
 
 data Console =
   Console {
-    messages :: !Messages,
     inputState :: !Haskeline.IO.InputState,
     world :: !World
   }
 
-consoleRun :: Messages -> World -> IO ExitCode
-consoleRun messages world = do
+consoleRun :: World -> IO ExitCode
+consoleRun world = do
   inputState <- Haskeline.IO.initializeInput
     Haskeline.defaultSettings
-  let console = Console { messages, inputState, world }
+  let console = Console { inputState, world }
   runReaderT consoleLoop console
     `finally` Haskeline.IO.cancelInput inputState
 
@@ -2438,6 +2443,22 @@ compileBuiltin = \case
   BuiltinNumModOf -> do
     compileBuiltinBinary StratStrict builtinNumModOf
 
+  BuiltinDrawClear -> pure do
+    send RequestDrawClear
+
+  BuiltinDrawColor -> pure do
+    r <- stackPop
+    g <- stackPop
+    b <- stackPop
+    join do
+      liftA3 builtinDrawColor
+        (varGet r)
+        (varGet g)
+        (varGet b)
+
+  BuiltinDrawShow -> pure do
+    send RequestDrawShow
+
 compileBuiltinBinary ::
   Strat ->
   (Value -> Value -> Code Value) ->
@@ -2472,6 +2493,10 @@ data Builtin
   | BuiltinNumDiv
   | BuiltinNumModOf
 
+  | BuiltinDrawColor
+  | BuiltinDrawClear
+  | BuiltinDrawShow
+
   deriving stock (Bounded, Enum, Eq, Generic, Ix, Ord, Show)
 
 builtins :: Array Builtin Name
@@ -2484,7 +2509,10 @@ builtins = Array.array (minBound, maxBound)
     (BuiltinNumSubFrom,  Name "sub-from"),
     (BuiltinNumMul,      Name "mul"     ),
     (BuiltinNumDiv,      Name "div"     ),
-    (BuiltinNumModOf,    Name "mod-of"  )
+    (BuiltinNumModOf,    Name "mod-of"  ),
+    (BuiltinDrawColor,   Name "color"   ),
+    (BuiltinDrawClear,   Name "clear"   ),
+    (BuiltinDrawShow,    Name "show"    )
   ]
 
 builtinIds :: Scope Builtin
@@ -2571,3 +2599,34 @@ builtinNumBinary name f = curry \case
       "and",
       debug value2
     ]
+
+builtinDrawColor ::
+  Value ->
+  Value ->
+  Value ->
+  Code ()
+builtinDrawColor
+  (ValueNatural r)
+  (ValueNatural g)
+  (ValueNatural b)
+  | r <= 255, g <= 255, b <= 255 =
+    send
+      (RequestDrawColor
+        (fromIntegral r)
+        (fromIntegral g)
+        (fromIntegral b)
+        255)
+
+builtinDrawColor value1 value2 value3 =
+  (throw . sep) (
+    [
+      "can't apply",
+      debug (builtinName BuiltinDrawColor),
+      "to"
+    ] <>
+    commas [
+      debug value1,
+      debug value2,
+      "and" <+> debug value3
+    ]
+  )
