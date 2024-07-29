@@ -178,6 +178,7 @@ import Data.Traversable (for)
 import Data.Tuple qualified as Tuple
 import Data.Void (Void, absurd, vacuous)
 import Data.Word (Word8)
+import Foreign.C.Types (CInt)
 import GHC.Generics (Generic)
 import GHC.Exts (IsString)
 import GHC.Exts qualified
@@ -201,6 +202,7 @@ import SDL (($=))
 import SDL qualified
 import System.Console.Haskeline qualified as Haskeline
 import System.Console.Haskeline.IO qualified as Haskeline.IO
+import System.Environment qualified as Environment
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPrint, hPutStrLn, stderr)
 import System.Mem.Weak (Weak)
@@ -208,7 +210,12 @@ import System.Mem.Weak qualified as Weak
 import System.Timeout qualified as Timeout
 
 main :: IO ()
-main = startIO defaultSettings
+main = do
+  args <- Environment.getArgs
+  startIO
+    defaultSettings {
+      sources = Seq [SourcePath path | path <- args]
+    }
 
 ----------------------------------------------------------------
 
@@ -255,7 +262,9 @@ startIO settings = do
   let
     startInput = do
       codeRun world do
-        for_ compiledPrograms void
+        for_ compiledPrograms \program -> do
+          void program
+          flush
       exitCode <- case settings.input of
         InputBatch ->
           pure ExitSuccess
@@ -307,7 +316,11 @@ newtype Messages =
 data Request
   = RequestOutput !Text
   | RequestDrawClear
-  | RequestDrawColor !(Word8) !(Word8) !(Word8) !(Word8)
+  | RequestDrawColor !(SDL.V4 Word8)
+  | RequestDrawLine
+    !(SDL.Point SDL.V2 CInt)
+    !(SDL.Point SDL.V2 CInt)
+  | RequestDrawRect !(Lazy.Maybe (SDL.Rectangle CInt))
   | RequestDrawShow
   | RequestExit !ExitCode
   deriving stock (Generic, Show)
@@ -360,7 +373,10 @@ graphicsRun messages =
 graphicsPoll ::
   Graphics -> Messages -> ExceptT ExitCode IO ()
 graphicsPoll graphics messages = do
-  events <- liftIO SDL.pollEvents
+  let timeout_ms = 10
+  events <- liftA2 (Lazy.maybe identity (:))
+    (SDL.waitEventTimeout timeout_ms)
+    SDL.pollEvents
   let
     (interruptions, payloads) =
       Lazy.partitionEithers (fmap eventParse events)
@@ -374,15 +390,9 @@ graphicsEvent ::
   ExceptT ExitCode IO ()
 graphicsEvent graphics = \case
   SDL.WindowShownEvent{} -> do
-    SDL.rendererDrawColor graphics.renderer $=
-      SDL.V4 192 64 64 255
-    SDL.clear graphics.renderer
-    SDL.present graphics.renderer
+    pure ()
   SDL.WindowExposedEvent{} -> do
-    SDL.rendererDrawColor graphics.renderer $=
-      SDL.V4 64 192 64 255
-    SDL.clear graphics.renderer
-    SDL.present graphics.renderer
+    pure ()
   _ -> pure ()
 
 graphicsRequest ::
@@ -394,10 +404,12 @@ graphicsRequest graphics = \case
     Text.IO.putStrLn text
   RequestDrawClear -> lift do
     SDL.clear graphics.renderer
-  RequestDrawColor r g b a -> lift do
-    SDL.rendererDrawColor graphics.renderer $=
-      SDL.V4 r g b a
-    SDL.clear graphics.renderer
+  RequestDrawColor color -> lift do
+    SDL.rendererDrawColor graphics.renderer $= color
+  RequestDrawLine point1 point2 -> lift do
+    SDL.drawLine graphics.renderer point1 point2
+  RequestDrawRect rects -> lift do
+    SDL.fillRect graphics.renderer rects
   RequestDrawShow -> lift do
     SDL.present graphics.renderer
   RequestExit exitCode ->
@@ -415,7 +427,7 @@ messagesLoop ::
   IO ExitCode
 messagesLoop messages poll handle =
   fmap
-    (either Prelude.id (const ExitSuccess))
+    (either identity (const ExitSuccess))
     (Error.runExceptT loop)
   where
     loop = do
@@ -1191,7 +1203,9 @@ consoleLoop = do
       Lazy.Nothing -> do
         world <- Reader.asks (.world)
         results <- codeTry world do
-          join (compileOne line)
+          compiled <- compileOne line
+          compiled
+          flush
         consoleOutput =<< case results of
           Right () ->
             fmap
@@ -1244,9 +1258,24 @@ type Nat = Prelude.Word
 each :: (Foldable t) => t a -> [a]
 each = Foldable.toList
 
+{-# Inline identity #-}
+identity :: a -> a
+identity = Prelude.id
+
 ----------------------------------------------------------------
 --  Extensions
 ----------------------------------------------------------------
+
+liftA4 ::
+  (Applicative f) =>
+  (a -> b -> c -> d -> e) ->
+  f a ->
+  f b ->
+  f c ->
+  f d ->
+  f e
+liftA4 f fa fb fc fd =
+  f <$> fa <*> fb <*> fc <*> fd
 
 sequence0 ::
   (Applicative f, Foldable t) =>
@@ -2390,6 +2419,15 @@ compileTerm = \case
     compileExpression body
   TermBlock _object block -> fmap snd do
     compileBlock block
+  --  do
+  --    _scope :!: body <- do
+  --      compileBlock block
+  --    var <- lift do
+  --      varNewStrict do
+  --        body
+  --        pure ValueNone
+  --    pure do
+  --      stackPush var
 
 compileExpression ::
   Parsed Expression ->
@@ -2421,6 +2459,18 @@ compileBuiltin ::
   Compile (Code ())
 compileBuiltin = \case
 
+  BuiltinStackCopy -> pure do
+    stackPush =<< stackPeek
+
+  BuiltinStackDrop -> pure do
+    void stackPop
+
+  BuiltinStackSwap -> pure do
+    former <- stackPop
+    latter <- stackPop
+    stackPush former
+    stackPush latter
+
   BuiltinVarGet -> pure do
     var <- stackPeek
     varForce var
@@ -2428,7 +2478,7 @@ compileBuiltin = \case
   BuiltinVarPutIn -> pure do
     var <- stackPop
     val <- stackPop
-    varPut var =<< varGet val
+    varPutLazy var (varGet val)
 
   BuiltinVarPostTo -> throw "TODO: post-to"
 
@@ -2455,6 +2505,30 @@ compileBuiltin = \case
         (varGet r)
         (varGet g)
         (varGet b)
+
+  BuiltinDrawLine -> pure do
+    x1 <- stackPop
+    y1 <- stackPop
+    x2 <- stackPop
+    y2 <- stackPop
+    join do
+      liftA4 builtinDrawLine
+        (varGet x1)
+        (varGet y1)
+        (varGet x2)
+        (varGet y2)
+
+  BuiltinDrawRect -> pure do
+    x <- stackPop
+    y <- stackPop
+    w <- stackPop
+    h <- stackPop
+    join do
+      liftA4 builtinDrawRect
+        (varGet x)
+        (varGet y)
+        (varGet w)
+        (varGet h)
 
   BuiltinDrawShow -> pure do
     send RequestDrawShow
@@ -2483,7 +2557,11 @@ compileBuiltinBinary strat builtin = do
 
 data Builtin
 
-  = BuiltinVarGet
+  = BuiltinStackCopy
+  | BuiltinStackDrop
+  | BuiltinStackSwap
+
+  | BuiltinVarGet
   | BuiltinVarPutIn
   | BuiltinVarPostTo
 
@@ -2495,6 +2573,8 @@ data Builtin
 
   | BuiltinDrawColor
   | BuiltinDrawClear
+  | BuiltinDrawLine
+  | BuiltinDrawRect
   | BuiltinDrawShow
 
   deriving stock (Bounded, Enum, Eq, Generic, Ix, Ord, Show)
@@ -2502,6 +2582,9 @@ data Builtin
 builtins :: Array Builtin Name
 builtins = Array.array (minBound, maxBound)
   [
+    (BuiltinStackCopy,   Name "copy"    ),
+    (BuiltinStackDrop,   Name "drop"    ),
+    (BuiltinStackSwap,   Name "swap"    ),
     (BuiltinVarGet,      Name "get"     ),
     (BuiltinVarPutIn,    Name "put-in"  ),
     (BuiltinVarPostTo,   Name "post-to" ),
@@ -2512,6 +2595,8 @@ builtins = Array.array (minBound, maxBound)
     (BuiltinNumModOf,    Name "mod-of"  ),
     (BuiltinDrawColor,   Name "color"   ),
     (BuiltinDrawClear,   Name "clear"   ),
+    (BuiltinDrawLine,    Name "line"    ),
+    (BuiltinDrawRect,    Name "rect"    ),
     (BuiltinDrawShow,    Name "show"    )
   ]
 
@@ -2612,10 +2697,11 @@ builtinDrawColor
   | r <= 255, g <= 255, b <= 255 =
     send
       (RequestDrawColor
-        (fromIntegral r)
-        (fromIntegral g)
-        (fromIntegral b)
-        255)
+        (SDL.V4
+          (fromIntegral r)
+          (fromIntegral g)
+          (fromIntegral b)
+          255))
 
 builtinDrawColor value1 value2 value3 =
   (throw . sep) (
@@ -2628,5 +2714,79 @@ builtinDrawColor value1 value2 value3 =
       debug value1,
       debug value2,
       "and" <+> debug value3
+    ]
+  )
+
+builtinDrawLine ::
+  Value ->
+  Value ->
+  Value ->
+  Value ->
+  Code ()
+builtinDrawLine
+  (ValueNatural x1)
+  (ValueNatural y1)
+  (ValueNatural x2)
+  (ValueNatural y2)
+  = send
+    (RequestDrawLine
+      (SDL.P
+        (SDL.V2
+          (fromIntegral x1)
+          (fromIntegral y1)))
+      (SDL.P
+        (SDL.V2
+          (fromIntegral x2)
+          (fromIntegral y2))))
+
+builtinDrawLine value1 value2 value3 value4 =
+  (throw . sep) (
+    [
+      "can't apply",
+      debug (builtinName BuiltinDrawLine),
+      "to"
+    ] <>
+    commas [
+      debug value1,
+      debug value2,
+      debug value3,
+      "and" <+> debug value4
+    ]
+  )
+
+builtinDrawRect ::
+  Value ->
+  Value ->
+  Value ->
+  Value ->
+  Code ()
+builtinDrawRect
+  (ValueNatural x)
+  (ValueNatural y)
+  (ValueNatural w)
+  (ValueNatural h)
+  = send (RequestDrawRect (Lazy.Just rect))
+  where
+    !rect = SDL.Rectangle
+      (SDL.P
+          (SDL.V2
+            (fromIntegral x)
+            (fromIntegral y)))
+      (SDL.V2
+        (fromIntegral w)
+        (fromIntegral h))
+
+builtinDrawRect value1 value2 value3 value4 =
+  (throw . sep) (
+    [
+      "can't apply",
+      debug (builtinName BuiltinDrawRect),
+      "to"
+    ] <>
+    commas [
+      debug value1,
+      debug value2,
+      debug value3,
+      "and" <+> debug value4
     ]
   )
